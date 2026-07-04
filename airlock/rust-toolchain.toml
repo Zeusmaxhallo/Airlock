@@ -1,0 +1,5 @@
+[toolchain]
+# Gepinnt am 2026-07-04: rustc 1.98.0-nightly (c397dae80 2026-07-02)
+# Muss zu TOOLCHAIN in src/main.rs und $toolchain in run_corpus.ps1 passen.
+channel = "nightly-2026-07-04"
+components = ["rustc-dev", "rust-src", "llvm-tools-preview"]
