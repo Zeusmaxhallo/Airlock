@@ -1,5 +1,9 @@
 #![feature(rustc_private)]
 
+mod storage_inventory;
+mod utility;
+
+
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -81,7 +85,6 @@ fn run_analysis(args: &Vec<String>) {
 
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
-    // seit 2025: Enum statt Option<Matches>
     let matches = match rustc_driver::handle_options(&early_dcx, args) {
         HandledOptions::Normal(m) => m,
         _ => std::process::exit(0),
@@ -89,10 +92,6 @@ fn run_analysis(args: &Vec<String>) {
 
     let opts = config::build_session_options(&mut early_dcx, &matches);
 
-    // Config wurde gegenüber nightly-2024-12-01 verschlankt:
-    // locale_resources, registry, expanded_args, hash_untracked_state entfallen;
-    // track_state und extra_symbols sind neu; using_internal_features ist
-    // jetzt &'static AtomicBool statt Arc.
     let config = Config {
         opts,
         crate_cfg: matches.opt_strs("cfg"),
@@ -116,17 +115,8 @@ fn run_analysis(args: &Vec<String>) {
     rustc_interface::run_compiler(config, |compiler| {
         let krate = rustc_interface::parse(&compiler.sess);
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            for item_id in tcx.hir_free_items() {
-
-                let item = tcx.hir_item(item_id);
-
-                if let rustc_hir::ItemKind::Fn { ident, .. } = item.kind {
-                    if ident.name.as_str() == "execute" {
-                        let def_id = item_id.owner_id.def_id.to_def_id();
-                        eprintln!("Found execute root: {}", tcx.def_path_str(def_id));
-                    }
-                }
-            }
+            let storage_inventory = storage_inventory::StorageInventory::build(tcx);
+            storage_inventory.print_inventory();
         });
     });
 }
