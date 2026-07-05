@@ -2,6 +2,7 @@
 
 mod storage_inventory;
 mod utility;
+mod call_graph;
 
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -125,6 +126,8 @@ fn run_analysis(args: &Vec<String>) {
                 eprintln!("No execute-Entry-Point, skipping analysis");
                 return;
             };
+
+            let call_graph = call_graph::CallGraph::build_from_root(tcx, root);
         });
     });
 }
