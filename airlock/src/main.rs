@@ -3,7 +3,6 @@
 mod storage_inventory;
 mod utility;
 
-
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -111,12 +110,16 @@ fn run_analysis(args: &Vec<String>) {
         using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
     };
 
-  
     rustc_interface::run_compiler(config, |compiler| {
         let krate = rustc_interface::parse(&compiler.sess);
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             let storage_inventory = storage_inventory::StorageInventory::build(tcx);
             storage_inventory.print_inventory();
+        
+            let Some(root) = utility::find_execute(tcx) else {
+                eprintln!("No execute-Entry-Point, skipping analysis");
+                return;
+            };
         });
     });
 }

@@ -106,8 +106,8 @@ foreach ($r in $units) {
     Pop-Location
     $sw.Stop()
 
-    $analyzed = ([regex]::Matches($out, [regex]::Escape("Analysiere Contract-Crate"))).Count
-    $roots    = ([regex]::Matches($out, "Found execute root")).Count
+    $analyzed = ([regex]::Matches($out, "Analysiere Contract-Crate|Analyze Contract-Crate")).Count
+    $roots    = ([regex]::Matches($out, "Found Execute Entry Point:")).Count
     # nur echte Compiler-/Airlock-Panics zählen, keine Build-Script-Panics
     $ice      = if ($out -match "internal compiler error|thread 'rustc' panicked|airlock(\.exe)? panicked") { "yes" } else { "no" }
 
