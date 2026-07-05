@@ -49,7 +49,12 @@ fn main() {
             run_real_rustc(&args[1..]);
         }
 
-        eprintln!("══ Analyze Contract-Crate ══");
+        let crate_name = args
+            .windows(2)
+            .find(|w| w[0] == "--crate-name")
+            .map(|w| w[1].as_str())
+            .unwrap_or("<unbekannt>");
+        eprintln!("══ Analyze Contract-Crate: {crate_name} ══");
         run_analysis(&args);
         run_real_rustc(&args[1..]);
     } else {
