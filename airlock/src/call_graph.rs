@@ -142,7 +142,12 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
 
 fn collect_call_sites<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<CallSite> {
     let mut call_sites = Vec::new();
-    let typing_env = ty::TypingEnv::fully_monomorphized();
+    // NICHT fully_monomorphized(): build_from_root läuft auch in generische
+    // Funktionen (z. B. levana QueryablePair::Request<T>, transmuter
+    // impl IntoIterator). Deren MIR enthält unsubstituierte Parameter; im
+    // Codegen-TypingMode ist fehlgeschlagene Normalisierung ein ICE
+    // (normalize_erasing_regions.rs "Failed to normalize Alias").
+    let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
 
     for (block, block_data) in body.basic_blocks.iter_enumerated() {
         let terminator = block_data.terminator();

@@ -1,4 +1,7 @@
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::{
+    mir::{Body, Operand},
+    ty::{TyCtxt, TyKind},
+};
 use rustc_span::def_id::DefId;
 
 /// Check if the crate name of the given `def_id` matches the provided `name`.
@@ -6,7 +9,7 @@ pub fn crate_name_is(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
     tcx.crate_name(def_id.krate).as_str() == name
 }
 
-//// Find the Execute Entry point
+/// Find the Execute Entry point
 pub fn find_execute(tcx: TyCtxt<'_>) -> Option<DefId> {
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
@@ -57,4 +60,21 @@ pub fn normalize_ty_str(s: &str) -> String {
         .replace(", >", ">")
         .replace(",>", ">");
     result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+
+
+/// Returns the 'DefId' of the callee if the call target is a direct
+/// function definition.
+/// Returns `None` for indirect calls (e.g., through function pointers
+/// or dynamic dispatch), where the callee cannot be resolved statically.
+pub fn callee_def_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> Option<DefId> {
+    match func.ty(&body.local_decls, tcx).kind() {
+        TyKind::FnDef(def_id, _) => Some(*def_id),
+        _ => None,
+    }
 }

@@ -1,8 +1,9 @@
 #![feature(rustc_private)]
 
+mod analysis;
+mod call_graph;
 mod storage_inventory;
 mod utility;
-mod call_graph;
 
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -12,10 +13,15 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use rustc_driver::HandledOptions;
+use rustc_hir::def_id::DefId;
 use rustc_interface::Config;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use crate::storage_inventory::StorageInventory;
 
 /// rustc 1.98.0-nightly (c397dae80 2026-07-02)
 const TOOLCHAIN: &str = "nightly-2026-07-04";
@@ -119,15 +125,37 @@ fn run_analysis(args: &Vec<String>) {
     rustc_interface::run_compiler(config, |compiler| {
         let krate = rustc_interface::parse(&compiler.sess);
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            let storage_inventory = storage_inventory::StorageInventory::build(tcx);
+            let storage_inventory = StorageInventory::build(tcx);
             storage_inventory.print_inventory();
-        
+
             let Some(root) = utility::find_execute(tcx) else {
                 eprintln!("No execute-Entry-Point, skipping analysis");
                 return;
             };
-
             let call_graph = call_graph::CallGraph::build_from_root(tcx, root);
+            let mut fn_comparisons: std::collections::HashMap<
+                DefId,
+                Vec<analysis::SenderComparison>,
+            > = std::collections::HashMap::new();
+
+            // TODO: implement and add return
+            find_auth_states(tcx, fn_comparisons, call_graph, storage_inventory);
         });
     });
+}
+
+fn find_auth_states(
+    tcx: TyCtxt,
+    mut fn_comparionsons: HashMap<DefId, Vec<analysis::SenderComparison>>,
+    call_graph: call_graph::CallGraph,
+    mut inventory: StorageInventory
+) {
+    for node in call_graph.nodes.iter(){
+        if tcx.is_mir_available(*node) {
+            let body = tcx.optimized_mir(*node);
+
+            let comparisons = analysis::analyze_function(tcx, body, &tcx.def_path_str(*node), &mut inventory);
+        }
+    }
+
 }
