@@ -62,8 +62,6 @@ pub fn normalize_ty_str(s: &str) -> String {
     result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-
-
 /// Returns the 'DefId' of the callee if the call target is a direct
 /// function definition.
 /// Returns `None` for indirect calls (e.g., through function pointers
@@ -77,4 +75,25 @@ pub fn callee_def_id<'tcx>(
         TyKind::FnDef(def_id, _) => Some(*def_id),
         _ => None,
     }
+}
+
+pub fn is_forwarding_glue_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    matches!(
+        tcx.item_name(def_id).as_str(),
+        "branch" | "from_residual" | "unwrap" | "map_err" | "into_ok" | "deref" | "deref_mut"
+    )
+}
+
+/// Returns `true` if the given function is a mutating `cw_storage_plus` storage
+/// operation (`save`, `insert`, or `update`). `update` is treated as a write sink.
+pub fn is_storage_write_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    crate_name_is(tcx, def_id, "cw_storage_plus")
+        && matches!(tcx.item_name(def_id).as_str(), "save" | "insert" | "update")
+}
+
+/// Returns `true` if the given function is a `cw_storage_plus` storage load
+/// operation (`load`, `may_load`, or `get`).
+pub fn is_storage_load_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    crate_name_is(tcx, def_id, "cw_storage_plus")
+        && matches!(tcx.item_name(def_id).as_str(), "load" | "may_load" | "get")
 }

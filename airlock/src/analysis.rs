@@ -1,14 +1,15 @@
-use crate::utility;
-use std::collections::HashSet;
-
+use crate::{
+    find_auth_states, storage_inventory::AuthStateVariable, utility::{self, callee_def_id, is_forwarding_glue_fn, is_storage_load_fn, normalize_ty_str},
+};
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue, Statement,
-        StatementKind, Terminator, TerminatorKind,
+        AggregateKind, BasicBlock, BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue,
+        Statement, StatementKind, Terminator, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
+use std::collections::{HashMap, HashSet};
 
 /// Pre-tainted entry points of a function, produced by interprocedural
 /// propagation over the call graph. Both kinds seed the intraprocedural
@@ -54,11 +55,24 @@ pub fn analyze_function<'tcx>(
     eprintln!("\nchecking function: '{}'", function_name);
 
     if comparisons.is_empty() {
-        eprintln!("[1] info.sender comparisons: no");
+        eprintln!("[1] info.sender comparisons: none");
     } else {
         eprintln!("[1] info.sender comparisons: {}", comparisons.len());
         for cmp in &comparisons {
             eprintln!("\t{:?} {}", cmp.location, cmp.description);
+        }
+    }
+
+    let auth_vars = find_auth_state_variables(tcx, body, &comparisons);
+    storage_inventory.auth_state_variables.extend(auth_vars.clone());
+    storage_inventory.update_auth_state(&auth_vars);
+
+    if auth_vars.is_empty() {
+        eprintln!("[2] Auth-State-Variables: none");
+    } else {
+        eprintln!("[2] Auth-State-Variables: {}", auth_vars.len());
+        for auth_var in &auth_vars{
+            eprint!("\t{} (load @ {:?})", auth_var.symbolic_name, auth_var.load_location);
         }
     }
 
@@ -203,7 +217,15 @@ fn check_terminator_comparison<'tcx>(
     // `cw_controllers::Admin::assert_admin`, `cw_ownable::update_ownership`, …
     if let (Some(callee), Some(name)) = (callee, callee_name.as_deref()) {
         if !callee.is_local() && is_auth_sink(name) {
-            check_auth_sink_call(tcx, callee, name, &arg_locals, sender_locals, location, results);
+            check_auth_sink_call(
+                tcx,
+                callee,
+                name,
+                &arg_locals,
+                sender_locals,
+                location,
+                results,
+            );
         }
     }
 }
@@ -349,11 +371,7 @@ fn check_iter_search_call(
 fn is_auth_sink(name: &str) -> bool {
     matches!(
         name,
-        "assert_admin"
-            | "assert_owner"
-            | "assert_only_owner"
-            | "update_ownership"
-            | "is_admin"
+        "assert_admin" | "assert_owner" | "assert_only_owner" | "update_ownership" | "is_admin"
     )
 }
 
@@ -633,4 +651,221 @@ fn place_is_sender_field<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, place: &Pla
     }
 
     false
+}
+
+pub fn find_auth_state_variables<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    comparisons: &[SenderComparison],
+) -> Vec<AuthStateVariable> {
+    let mut result = Vec::new();
+
+    let block_map = build_block_local_source_map(tcx, body);
+
+    for cmp in comparisons {
+        let call_source = trace_to_load_call(
+            tcx,
+            cmp.compared_local,
+            cmp.location.block,
+            body,
+            &block_map,
+            24,
+        );
+
+        let (callee, arg_locals, load_location) = match call_source {
+            Some(LocalSource::CallReturn {
+                callee,
+                arg_locals,
+                location,
+                ..
+            }) => (callee, arg_locals, location),
+            _ => continue,
+        };
+
+        // Only `cw_storage_plus` load operations yield an authorization state variable.
+        if !callee.map_or(false, |d| is_storage_load_fn(tcx, d)) {
+            continue;
+        }
+
+        let storage_item_local = match arg_locals.get(0).copied().flatten() {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let symbolic_name = find_storage_static_name(tcx, body, storage_item_local);
+
+        result.push(AuthStateVariable {
+            compared_local: cmp.compared_local,
+            storage_item_local,
+            symbolic_name,
+            load_location,
+        });
+    }
+
+    result
+}
+
+#[derive(Debug, Clone)]
+enum LocalSource {
+    CopiedFrom(Local),
+    CallReturn {
+        func_debug: String,
+        callee: Option<DefId>,
+        arg_locals: Vec<Option<Local>>,
+        location: Location,
+    },
+}
+/// Builds a map of MIR locals to their value sources within each basic block.
+fn build_block_local_source_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> HashMap<(BasicBlock, Local), LocalSource> {
+    let mut map = HashMap::new();
+
+    for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
+        for stmt in bb_data.statements.iter() {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (lhs, rhs) = assign.as_ref();
+                let source = match rhs {
+                    Rvalue::Use(Operand::Move(place), _) | Rvalue::Use(Operand::Copy(place), _) => {
+                        Some(LocalSource::CopiedFrom(place.local))
+                    }
+                    Rvalue::Ref(_, _, place) => Some(LocalSource::CopiedFrom(place.local)),
+                    Rvalue::RawPtr(_, place) => Some(LocalSource::CopiedFrom(place.local)),
+                    Rvalue::Cast(_, op, _) => operand_local(op).map(LocalSource::CopiedFrom),
+                    _ => None,
+                };
+                if let Some(src) = source {
+                    map.insert((bb_idx, lhs.local), src);
+                }
+            }
+        }
+
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &bb_data.terminator().kind
+        {
+            let location = Location {
+                block: bb_idx,
+                statement_index: bb_data.statements.len(),
+            };
+
+            map.insert(
+                (bb_idx, destination.local),
+                LocalSource::CallReturn {
+                    func_debug: format!("{:?}", func),
+                    callee: callee_def_id(tcx, body, func),
+                    arg_locals: args.iter().map(|a| operand_local(&a.node)).collect(),
+                    location,
+                },
+            );
+        }
+    }
+    map
+}
+
+fn trace_to_load_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    start_local: Local,
+    start_block: BasicBlock,
+    body: &Body<'tcx>,
+    block_map: &HashMap<(BasicBlock, Local), LocalSource>,
+    max_depth: usize,
+) -> Option<LocalSource> {
+    let mut predecessors: HashMap<BasicBlock, Vec<BasicBlock>> = HashMap::new();
+    for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
+        for succ in bb_data.terminator().successors() {
+            predecessors.entry(succ).or_default().push(bb_idx);
+        }
+    }
+
+    let mut queue: Vec<(BasicBlock, Local)> = vec![(start_block, start_local)];
+    let mut visisted: HashSet<(BasicBlock, Local)> = HashSet::new();
+
+    for _ in 0..max_depth {
+        let (block, local) = match queue.pop() {
+            Some(x) => x,
+            None => return None,
+        };
+
+        if !visisted.insert((block, local)) {
+            continue;
+        }
+
+        match block_map.get(&(block, local)) {
+            Some(LocalSource::CallReturn {
+                func_debug,
+                callee,
+                arg_locals,
+                location,
+            }) => {
+                if callee.map_or(false, |d| is_forwarding_glue_fn(tcx, d)) {
+                    // look through ?-/Deref-Glue -> follow first argument
+                    if let Some(Some(next_local)) = arg_locals.get(0) {
+                        queue.push((location.block, *next_local));
+                        continue;
+                    }
+                    return None;
+                }
+                // real interesting Call
+                return Some(LocalSource::CallReturn {
+                    func_debug: func_debug.clone(),
+                    callee: *callee,
+                    arg_locals: arg_locals.clone(),
+                    location: *location,
+                });
+            }
+            Some(LocalSource::CopiedFrom(next_local)) => {
+                // contiunue Search in this Block
+                queue.push((block, *next_local));
+            }
+            None => {
+                // not defined in this Block -> search all predecessors
+                if let Some(preds) = predecessors.get(&block) {
+                    for &pred in preds {
+                        queue.push((pred, local));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_storage_static_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    item_local: Local,
+) -> String {
+    let item_ty = body.local_decls[item_local].ty;
+
+    let base_ty = match item_ty.kind() {
+        TyKind::Ref(_,inner , _) => *inner,
+        _ => item_ty,
+    };
+
+    let base_ty_normalized = normalize_ty_str(&format!("{:?}", base_ty));
+
+    for local_def_id in tcx.iter_local_def_id() {
+        let kind = format!("{:?}", tcx.def_kind(local_def_id));
+        if kind != "Const" {
+            continue;
+        }
+
+        let def_id = local_def_id.to_def_id();
+        let const_ty = tcx.type_of(def_id).skip_binder();
+        let const_ty_normalized = normalize_ty_str(&format!("{:?}", const_ty));
+        let name = tcx.item_name(def_id).to_string();
+
+        if const_ty_normalized == base_ty_normalized {
+            return name;
+        }
+    }
+
+
+    base_ty_normalized
 }

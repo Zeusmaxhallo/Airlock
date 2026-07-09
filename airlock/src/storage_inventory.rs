@@ -92,4 +92,14 @@ impl StorageInventory {
             );
         }
     }
+
+    pub fn update_auth_state(&mut self, auth_vars: &Vec<AuthStateVariable>) {
+        for item in &mut self.items {
+            for auth_var in auth_vars {
+                if item.name == auth_var.symbolic_name {
+                    item.is_auth = true;
+                }
+            }
+        }
+    }
 }
