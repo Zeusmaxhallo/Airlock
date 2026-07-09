@@ -77,10 +77,24 @@ pub fn callee_def_id<'tcx>(
     }
 }
 
+/// Identity-preserving glue the load trace looks through: `?`-desugaring
+/// (`branch`/`from_residual`), `Option`/`Result` adapters that pass the
+/// success value through unchanged, and deref coercions. `may_load` does NOT
+/// belong here — it is the load *sink* (`is_storage_load_fn`); listing it as
+/// glue would make the trace step through the load instead of returning it.
 pub fn is_forwarding_glue_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     matches!(
         tcx.item_name(def_id).as_str(),
-        "branch" | "from_residual" | "unwrap" | "map_err" | "into_ok" | "deref" | "deref_mut"
+        "branch"
+            | "from_residual"
+            | "unwrap"
+            | "expect"
+            | "ok_or"
+            | "ok_or_else"
+            | "map_err"
+            | "into_ok"
+            | "deref"
+            | "deref_mut"
     )
 }
 

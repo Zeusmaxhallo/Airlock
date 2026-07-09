@@ -127,9 +127,9 @@ fn run_analysis(args: &Vec<String>) {
         let krate = rustc_interface::parse(&compiler.sess);
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             let storage_inventory = StorageInventory::build(tcx);
-            storage_inventory.print_inventory();
 
             let Some(root) = utility::find_execute(tcx) else {
+                storage_inventory.print_inventory();
                 eprintln!("No execute-Entry-Point, skipping analysis");
                 return;
             };
@@ -274,4 +274,8 @@ fn find_auth_states(tcx: TyCtxt, call_graph: &call_graph::CallGraph, mut invento
         let s = seeds.get(&n).cloned().unwrap_or_default();
         let _ = analysis::analyze_function(tcx, body, &tcx.def_path_str(n), &s, &mut inventory);
     }
+
+    // 4. Print the inventory only now — after `update_auth_state` has run for
+    //    every analysed function — so `[auth]` marks are actually visible.
+    inventory.print_inventory();
 }

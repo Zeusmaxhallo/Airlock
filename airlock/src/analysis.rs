@@ -1,7 +1,7 @@
 use crate::{
-    find_auth_states, storage_inventory::AuthStateVariable, utility::{self, callee_def_id, is_forwarding_glue_fn, is_storage_load_fn, normalize_ty_str},
+    storage_inventory::AuthStateVariable, utility::{self, callee_def_id, is_forwarding_glue_fn, is_storage_load_fn, normalize_ty_str},
 };
-use rustc_hir::def_id::DefId;
+use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlock, BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue,
@@ -26,7 +26,7 @@ pub struct SenderSeeds {
     pub upvar_indices: HashSet<usize>,
 }
 
-use crate::storage_inventory::{self, StorageInventory};
+use crate::storage_inventory::StorageInventory;
 
 #[derive(Debug, Clone)]
 pub struct SenderComparison {
@@ -72,7 +72,7 @@ pub fn analyze_function<'tcx>(
     } else {
         eprintln!("[2] Auth-State-Variables: {}", auth_vars.len());
         for auth_var in &auth_vars{
-            eprint!("\t{} (load @ {:?})", auth_var.symbolic_name, auth_var.load_location);
+            eprintln!("\t{} (load @ {:?})", auth_var.symbolic_name, auth_var.load_location);
         }
     }
 
@@ -692,12 +692,14 @@ pub fn find_auth_state_variables<'tcx>(
             None => continue,
         };
 
-        let symbolic_name = find_storage_static_name(tcx, body, storage_item_local);
+        let (symbolic_name, storage_def_id) =
+            find_storage_static_name(tcx, body, storage_item_local);
 
         result.push(AuthStateVariable {
             compared_local: cmp.compared_local,
             storage_item_local,
             symbolic_name,
+            storage_def_id,
             load_location,
         });
     }
@@ -836,36 +838,46 @@ fn trace_to_load_call<'tcx>(
     None
 }
 
+/// Resolves the storage constant a load receiver refers to.
+///
+/// Matches the receiver's type against the type of every local `const` item
+/// via canonical type identity — both sides region-erased and compared as
+/// interned `Ty`s. String comparison of formatted types is unreliable here:
+/// MIR local types carry erased regions while `type_of` results carry
+/// early-bound ones, and their `Debug`/`Display` renderings differ.
+///
+/// Returns the constant's name and `DefId` on success; otherwise falls back
+/// to the normalized type string (display only, no `DefId`).
+///
+/// Inherent limit: two storage constants of the same type (e.g. two
+/// `Item<Config>`) are indistinguishable by type — the first match wins.
 fn find_storage_static_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     item_local: Local,
-) -> String {
+) -> (String, Option<DefId>) {
     let item_ty = body.local_decls[item_local].ty;
 
-    let base_ty = match item_ty.kind() {
-        TyKind::Ref(_,inner , _) => *inner,
-        _ => item_ty,
-    };
+    // Peel all references — the load receiver is usually `&Item<T>`.
+    let mut base_ty = item_ty;
+    while let TyKind::Ref(_, inner, _) = base_ty.kind() {
+        base_ty = *inner;
+    }
 
-    let base_ty_normalized = normalize_ty_str(&format!("{:?}", base_ty));
+    let base_ty_erased = tcx.erase_and_anonymize_regions(base_ty);
 
     for local_def_id in tcx.iter_local_def_id() {
-        let kind = format!("{:?}", tcx.def_kind(local_def_id));
-        if kind != "Const" {
+        if !matches!(tcx.def_kind(local_def_id), DefKind::Const { .. }) {
             continue;
         }
 
         let def_id = local_def_id.to_def_id();
         let const_ty = tcx.type_of(def_id).skip_binder();
-        let const_ty_normalized = normalize_ty_str(&format!("{:?}", const_ty));
-        let name = tcx.item_name(def_id).to_string();
 
-        if const_ty_normalized == base_ty_normalized {
-            return name;
+        if tcx.erase_and_anonymize_regions(const_ty) == base_ty_erased {
+            return (tcx.item_name(def_id).to_string(), Some(def_id));
         }
     }
 
-
-    base_ty_normalized
+    (normalize_ty_str(&format!("{:?}", base_ty)), None)
 }

@@ -25,6 +25,9 @@ pub struct AuthStateVariable {
     pub compared_local: Local,
     pub storage_item_local: Local,
     pub symbolic_name: String,
+    /// `DefId` of the resolved storage constant, if type-based resolution
+    /// succeeded. Used for exact matching against inventory items.
+    pub storage_def_id: Option<DefId>,
     pub load_location: Location,
 }
 
@@ -93,10 +96,15 @@ impl StorageInventory {
         }
     }
 
+    /// Marks inventory items referenced by resolved auth-state variables.
+    ///
+    /// Matches by `DefId`, not by name: several storage constants may share a
+    /// name across modules (e.g. `CONFIG` in `state` and in `migrations::*`),
+    /// and name matching would mark all of them.
     pub fn update_auth_state(&mut self, auth_vars: &Vec<AuthStateVariable>) {
         for item in &mut self.items {
             for auth_var in auth_vars {
-                if item.name == auth_var.symbolic_name {
+                if auth_var.storage_def_id == Some(item.def_id) {
                     item.is_auth = true;
                 }
             }
