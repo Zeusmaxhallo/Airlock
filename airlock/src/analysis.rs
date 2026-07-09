@@ -1,13 +1,29 @@
 use crate::utility;
 use std::collections::HashSet;
 
+use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{
-        BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue, Statement, StatementKind,
-        Terminator, TerminatorKind,
+        AggregateKind, BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue, Statement,
+        StatementKind, Terminator, TerminatorKind,
     },
-    ty::{TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
+
+/// Pre-tainted entry points of a function, produced by interprocedural
+/// propagation over the call graph. Both kinds seed the intraprocedural
+/// taint before it is computed for a body:
+/// * `param_locals` — formal parameters (`_1`, `_2`, …) that a caller passed a
+///   sender-tainted argument to (e.g. `is_admin(&info.sender)`).
+/// * `upvar_indices` — closure upvar field indices whose captured value was
+///   sender-tainted in the enclosing function (e.g. `|a| a == info.sender`,
+///   where `info.sender` is captured). Inside the closure the upvar is read as
+///   a field of the environment local `_1`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SenderSeeds {
+    pub param_locals: HashSet<Local>,
+    pub upvar_indices: HashSet<usize>,
+}
 
 use crate::storage_inventory::{self, StorageInventory};
 
@@ -29,29 +45,33 @@ pub fn analyze_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     fn_name: &str,
+    seeds: &SenderSeeds,
     storage_inventory: &mut StorageInventory,
 ) -> Vec<SenderComparison> {
-    let comparisons = find_sender_comparisons(tcx, body);
+    let comparisons = find_sender_comparisons(tcx, body, seeds);
 
     let function_name = fn_name.split("::").last().unwrap_or(fn_name);
-    eprintln!("\nchecking function: '{}'",function_name);
+    eprintln!("\nchecking function: '{}'", function_name);
 
     if comparisons.is_empty() {
         eprintln!("[1] info.sender comparisons: no");
     } else {
         eprintln!("[1] info.sender comparisons: {}", comparisons.len());
-        for cmp in &comparisons{
+        for cmp in &comparisons {
             eprintln!("\t{:?} {}", cmp.location, cmp.description);
         }
     }
-    
 
     comparisons
 }
 /// find all info.sender comparisons
-fn find_sender_comparisons<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<SenderComparison> {
+fn find_sender_comparisons<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    seeds: &SenderSeeds,
+) -> Vec<SenderComparison> {
     let mut results = Vec::new();
-    let sender_locals = collect_sender_locals(tcx, body);
+    let sender_locals = compute_sender_locals(tcx, body, seeds);
 
     for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
@@ -150,7 +170,8 @@ fn check_terminator_comparison<'tcx>(
     };
 
     let func_debug = format!("{:?}", func);
-    let callee_name = utility::callee_def_id(tcx, body, func).map(|d| tcx.item_name(d).to_string());
+    let callee = utility::callee_def_id(tcx, body, func);
+    let callee_name = callee.map(|d| tcx.item_name(d).to_string());
     let arg_locals: Vec<Option<Local>> = args.iter().map(|a| operand_local(&a.node)).collect();
 
     match callee_name.as_deref() {
@@ -172,6 +193,18 @@ fn check_terminator_comparison<'tcx>(
             check_iter_search_call(&func_debug, &arg_locals, sender_locals, location, results);
         }
         _ => {}
+    }
+
+    // Auth-sink: a call to a known library authorization helper whose actual
+    // comparison lives in a dependency crate (non-local) and is therefore not
+    // available as MIR to analyse. If info.sender is passed to it, we record
+    // the call itself as a detected access-control check. This closes the
+    // recall gap for the dominant CosmWasm pattern — `cw_ownable::assert_owner`,
+    // `cw_controllers::Admin::assert_admin`, `cw_ownable::update_ownership`, …
+    if let (Some(callee), Some(name)) = (callee, callee_name.as_deref()) {
+        if !callee.is_local() && is_auth_sink(name) {
+            check_auth_sink_call(tcx, callee, name, &arg_locals, sender_locals, location, results);
+        }
     }
 }
 
@@ -308,43 +341,174 @@ fn check_iter_search_call(
     }
 }
 
-/// Collects all MIR locals that directly or indirectly originate from `cosmwasm_std::MessageInfo.sender`
-fn collect_sender_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
-    let mut sender_locals = HashSet::new();
+/// Names of well-known CosmWasm library functions that perform an
+/// authorization check internally (comparing the caller against a stored
+/// owner/admin). Their body lives in a dependency crate and is not available
+/// as MIR, so the *call* — with `info.sender` as an argument — is what we
+/// treat as the check.
+fn is_auth_sink(name: &str) -> bool {
+    matches!(
+        name,
+        "assert_admin"
+            | "assert_owner"
+            | "assert_only_owner"
+            | "update_ownership"
+            | "is_admin"
+    )
+}
 
-    for (_, bb_data) in body.basic_blocks.iter_enumerated() {
-        for stmt in &bb_data.statements {
-            if let StatementKind::Assign(expr) = &stmt.kind {
-                let (lhs, rhs) = expr.as_ref();
+/// Records a call to a known authorization helper (see [`is_auth_sink`]) as a
+/// detected sender check, provided `info.sender` is among its arguments. The
+/// stored owner/admin it is compared against is internal to the dependency, so
+/// there is no `compared_local` in caller space; the description names the sink.
+fn check_auth_sink_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee: DefId,
+    name: &str,
+    arg_locals: &[Option<Local>],
+    sender_locals: &HashSet<Local>,
+    location: Location,
+    results: &mut Vec<SenderComparison>,
+) {
+    let sender_arg = arg_locals
+        .iter()
+        .filter_map(|a| *a)
+        .find(|l| sender_locals.contains(l));
+    if let Some(sender_local) = sender_arg {
+        let krate = tcx.crate_name(callee.krate);
+        results.push(SenderComparison {
+            location,
+            sender_local,
+            compared_local: sender_local,
+            op: BinOp::Eq,
+            description: format!(
+                "auth-sink '{}::{}': info.sender ({:?}) checked against stored owner/admin",
+                krate, name, sender_local
+            ),
+        });
+    }
+}
 
-                match rhs {
-                    Rvalue::Use(Operand::Copy(place), _) | Rvalue::Use(Operand::Move(place), _) => {
-                        if place_is_sender_field(tcx, body, place) {
-                            sender_locals.insert(lhs.local);
-                        }
-                    }
-                    Rvalue::Ref(_, _, place) => {
-                        if place_is_sender_field(tcx, body, place) {
-                            sender_locals.insert(lhs.local);
-                        }
-                    }
-                    Rvalue::RawPtr(_, _) => {
+/// Collects all MIR locals that directly or indirectly originate from
+/// `cosmwasm_std::MessageInfo.sender`, seeded with any interprocedurally
+/// pre-tainted parameters / closure upvars in `seeds`.
+pub fn compute_sender_locals<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    seeds: &SenderSeeds,
+) -> HashSet<Local> {
+    // Start from the interprocedural seeds: parameters a caller passed a
+    // sender-tainted argument to are tainted from the first iteration.
+    let mut sender_locals: HashSet<Local> = seeds.param_locals.clone();
+
+    // Fixed-point taint propagation: A single forward pass can miss cases
+    // where the definition of a local appears after its use in block order
+    // (common with closure captures). Therefore, iterate until the set of
+    // sender-tainted locals no longer grows.
+    loop {
+        let start_len = sender_locals.len();
+
+        for (_, bb_data) in body.basic_blocks.iter_enumerated() {
+            for stmt in &bb_data.statements {
+                if let StatementKind::Assign(expr) = &stmt.kind {
+                    let (lhs, rhs) = expr.as_ref();
+                    if rvalue_is_sender_tainted(tcx, body, rhs, &sender_locals, seeds) {
                         sender_locals.insert(lhs.local);
                     }
-                    _ => {}
                 }
-                if let Rvalue::Use(op, _) = rhs {
-                    if let Some(src_local) = operand_local(op) {
-                        if sender_locals.contains(&src_local) {
-                            sender_locals.insert(lhs.local);
-                        }
+            }
+
+            // Identity-preserving calls (as_ref/as_str/to_string/clone/...)
+            // propagate the sender taint to their return value. Example:
+            // `let sender = info.sender.to_string();` -> `sender` becomes
+            // tainted, making later checks such as
+            // `iter().any(|v| *v == sender)` visible through closure captures.
+            if let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &bb_data.terminator().kind
+            {
+                let callee_name =
+                    utility::callee_def_id(tcx, body, func).map(|d| tcx.item_name(d).to_string());
+                if callee_name
+                    .as_deref()
+                    .map(is_identity_preserving)
+                    .unwrap_or(false)
+                {
+                    let any_arg_tainted = args
+                        .iter()
+                        .filter_map(|a| operand_local(&a.node))
+                        .any(|l| sender_locals.contains(&l));
+                    if any_arg_tainted {
+                        sender_locals.insert(destination.local);
                     }
                 }
             }
         }
+
+        if sender_locals.len() == start_len {
+            break;
+        }
     }
 
     sender_locals
+}
+
+/// True, wenn `rhs` einen Sender-Wert an sein LHS weitergibt: entweder direkt
+/// aus `info.sender` oder abgeleitet aus einem bereits getainteten Local.
+fn rvalue_is_sender_tainted<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    rhs: &Rvalue<'tcx>,
+    sender_locals: &HashSet<Local>,
+    seeds: &SenderSeeds,
+) -> bool {
+    // A place carries the sender taint if it is `info.sender`, reads an
+    // already-tainted local, or reads a seeded closure upvar.
+    let place_tainted = |place: &Place<'tcx>| {
+        place_is_sender_field(tcx, body, place)
+            || sender_locals.contains(&place.local)
+            || place_reads_seeded_upvar(place, seeds)
+    };
+    match rhs {
+        Rvalue::Use(Operand::Copy(place), _) | Rvalue::Use(Operand::Move(place), _) => {
+            place_tainted(place)
+        }
+        // &info.sender ODER eine Referenz auf ein bereits getaintetes Local
+        // (z. B. der Capture `&sender` einer Closure).
+        Rvalue::Ref(_, _, place) => place_tainted(place),
+        // RawPtr nur noch, wenn das Ziel tatsaechlich der Sender ist. Zuvor wurde
+        // JEDER RawPtr unbedingt getaintet -> bekannte False-Positive-Quelle.
+        Rvalue::RawPtr(_, place) => place_tainted(place),
+        // Aggregat (Closure-Env, Tupel, Struct): enthaelt eines der Felder den
+        // Sender, gilt das Aggregat als sender-getaintet. Dadurch wird die Closure
+        // von `iter().any(|x| x == info.sender)` am Call-Site als sender-tragendes
+        // Argument sichtbar und `check_iter_search_call` kann feuern.
+        Rvalue::Aggregate(_, operands) => operands
+            .iter()
+            .filter_map(|op| operand_local(op))
+            .any(|l| sender_locals.contains(&l)),
+        _ => false,
+    }
+}
+
+/// Methoden, die die Sender-Identitaet erhalten (Ref/Deref/String-Konversion).
+/// Ihr Rueckgabewert traegt denselben Sender-Taint wie ihr Empfaenger.
+fn is_identity_preserving(name: &str) -> bool {
+    matches!(
+        name,
+        "as_ref"
+            | "as_str"
+            | "as_bytes"
+            | "to_string"
+            | "to_owned"
+            | "clone"
+            | "deref"
+            | "deref_mut"
+            | "borrow"
+    )
 }
 
 /// Checks if an operand is a local variable and returns it
@@ -352,6 +516,77 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => Some(place.local),
         _ => None,
+    }
+}
+
+/// True if `place` reads a closure upvar that interprocedural propagation has
+/// marked as sender-tainted. Inside a closure body the environment is the
+/// first local (`_1`) and each captured upvar is a field of it — accessed as
+/// `((*_1).k)` (by-ref capture) or `(_1.k)` (by-value). We treat a place as a
+/// tainted-upvar read if its base is `_1` and it projects a field whose index
+/// is in `seeds.upvar_indices`. Only closures ever receive `upvar_indices`, so
+/// this never fires for ordinary functions.
+fn place_reads_seeded_upvar(place: &Place<'_>, seeds: &SenderSeeds) -> bool {
+    if seeds.upvar_indices.is_empty() {
+        return false;
+    }
+    if place.local != Local::from_u32(1) {
+        return false;
+    }
+    for elem in place.projection.iter() {
+        if let PlaceElem::Field(field_idx, _) = elem {
+            if seeds.upvar_indices.contains(&field_idx.as_usize()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Finds every closure created in `body` via an aggregate, returning each
+/// closure's `DefId` together with the caller locals captured as its upvars
+/// (in upvar-field order; `None` for constant captures). Used by the
+/// interprocedural pass to propagate sender taint from a captured value into
+/// the corresponding upvar of the closure body.
+pub fn find_closure_captures<'tcx>(body: &Body<'tcx>) -> Vec<(DefId, Vec<Option<Local>>)> {
+    let mut out = Vec::new();
+    for (_, bb_data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &bb_data.statements {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (_lhs, rvalue) = assign.as_ref();
+                if let Rvalue::Aggregate(kind, operands) = rvalue {
+                    if let AggregateKind::Closure(closure_def, _) = &**kind {
+                        let caps = operands.iter().map(|op| operand_local(op)).collect();
+                        out.push((*closure_def, caps));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True if `ty` (after stripping references) is a type that can carry a sender
+/// identity: `cosmwasm_std::Addr` / `CanonicalAddr`, `String`, or `str`. Used
+/// to type-gate interprocedural seeds so that non-address parameters (e.g.
+/// `Vec<Asset>`) are never mistaken for the sender — the main false-positive
+/// source of naive argument/capture propagation.
+pub fn ty_is_sender_like<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let mut ty = ty;
+    // Referenzen abtragen: &Addr, &&str, &String, ...
+    while let TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = *inner;
+    }
+    match ty.kind() {
+        TyKind::Str => true,
+        TyKind::Adt(adt_def, _) => {
+            let path = tcx.def_path_str(adt_def.did());
+            path == "cosmwasm_std::Addr"
+                || path == "cosmwasm_std::CanonicalAddr"
+                || path == "String"
+                || path.ends_with("::String")
+        }
+        _ => false,
     }
 }
 

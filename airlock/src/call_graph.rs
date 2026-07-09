@@ -20,6 +20,8 @@ pub struct CallGraph {
 pub struct CallSite {
     /// Location of the `Call` terminator in the caller.
     pub location: Location,
+    /// Function that contains this call 
+    pub caller: DefId,
     /// Resolved callee.
     pub callee: DefId,
     /// Actual arguments as caller locals; `None` for constant operands.
@@ -142,6 +144,7 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
 
 fn collect_call_sites<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<CallSite> {
     let mut call_sites = Vec::new();
+    let caller = body.source.def_id();
     // NICHT fully_monomorphized(): build_from_root läuft auch in generische
     // Funktionen (z. B. levana QueryablePair::Request<T>, transmuter
     // impl IntoIterator). Deren MIR enthält unsubstituierte Parameter; im
@@ -178,6 +181,7 @@ fn collect_call_sites<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<CallSit
                             block,
                             statement_index: block_data.statements.len(),
                         },
+                        caller,
                         callee,
                         arg_locals: (args.iter().map(|a| operand_local(&a.node)).collect()),
                         destination: destination.local,

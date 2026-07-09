@@ -15,10 +15,11 @@ extern crate rustc_span;
 use rustc_driver::HandledOptions;
 use rustc_hir::def_id::DefId;
 use rustc_interface::Config;
+use rustc_middle::mir::Local;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::storage_inventory::StorageInventory;
@@ -133,29 +134,144 @@ fn run_analysis(args: &Vec<String>) {
                 return;
             };
             let call_graph = call_graph::CallGraph::build_from_root(tcx, root);
-            let mut fn_comparisons: std::collections::HashMap<
-                DefId,
-                Vec<analysis::SenderComparison>,
-            > = std::collections::HashMap::new();
-
-            // TODO: implement and add return
-            find_auth_states(tcx, fn_comparisons, call_graph, storage_inventory);
+            find_auth_states(tcx, &call_graph, storage_inventory);
         });
     });
 }
 
-fn find_auth_states(
-    tcx: TyCtxt,
-    mut fn_comparionsons: HashMap<DefId, Vec<analysis::SenderComparison>>,
-    call_graph: call_graph::CallGraph,
-    mut inventory: StorageInventory
-) {
-    for node in call_graph.nodes.iter(){
-        if tcx.is_mir_available(*node) {
-            let body = tcx.optimized_mir(*node);
-
-            let comparisons = analysis::analyze_function(tcx, body, &tcx.def_path_str(*node), &mut inventory);
+/// Interprocedural sender-taint analysis over the call graph.
+///
+/// Intraprocedural taint alone misses access-control checks where the sender
+/// arrives indirectly: as a *function argument* (`is_admin(&info.sender)`) or
+/// as a *closure upvar* (`admins.iter().any(|a| a == info.sender)`). This pass
+/// computes a fixed point: taint each function with its current seeds, then
+/// propagate sender-tainted actuals into the callee's formal parameters and
+/// sender-tainted captures into the closure's upvars, until the seeds stop
+/// growing. The final detection pass then runs with stable seeds.
+fn find_auth_states(tcx: TyCtxt, call_graph: &call_graph::CallGraph, mut inventory: StorageInventory) {
+    // 1. Analysis set: call-graph nodes plus every (possibly nested) closure
+    //    created via an aggregate. Closures are not call edges but still need
+    //    to be tainted and analysed. `closure_caps` records, per closure
+    //    aggregate, the enclosing function and the captured caller locals.
+    let mut nodes: HashSet<DefId> = call_graph.nodes.clone();
+    let mut closure_caps: Vec<(DefId, DefId, Vec<Option<Local>>)> = Vec::new();
+    let mut worklist: Vec<DefId> = call_graph.nodes.iter().copied().collect();
+    let mut scanned: HashSet<DefId> = HashSet::new();
+    while let Some(n) = worklist.pop() {
+        if !scanned.insert(n) {
+            continue;
+        }
+        if !n.is_local() || !tcx.is_mir_available(n) {
+            continue;
+        }
+        let body = tcx.optimized_mir(n);
+        for (closure_def, caps) in analysis::find_closure_captures(body) {
+            closure_caps.push((n, closure_def, caps));
+            if closure_def.is_local() && nodes.insert(closure_def) {
+                worklist.push(closure_def);
+            }
         }
     }
 
+    // 2. Fixed point over seeds. Seeds grow monotonically; the iteration cap is
+    //    a safety net against pathological cases.
+    let mut seeds: HashMap<DefId, analysis::SenderSeeds> = HashMap::new();
+    let mut taint: HashMap<DefId, HashSet<Local>> = HashMap::new();
+
+    for _ in 0..16 {
+        for &n in &nodes {
+            if !n.is_local() || !tcx.is_mir_available(n) {
+                continue;
+            }
+            let body = tcx.optimized_mir(n);
+            let s = seeds.get(&n).cloned().unwrap_or_default();
+            taint.insert(n, analysis::compute_sender_locals(tcx, body, &s));
+        }
+
+        let before = seeds.clone();
+
+        // 2a. Argument wiring: a sender-tainted actual at position `i` taints
+        //     the callee's formal parameter `_{i+1}` — but only if the passed
+        //     value has a sender-compatible type. We gate on the *caller's*
+        //     argument type, not the callee parameter: the callee may be
+        //     generic (`addr: impl AsRef<str>`), whose formal type is only a
+        //     type parameter, while the actual passed at the call site is
+        //     concrete (`Addr`/`&Addr`/`&str`). This keeps the taint out of
+        //     non-address parameters (e.g. a `Vec<Asset>`, the main FP source)
+        //     while still seeding generic helpers like `is_admin`.
+        for sites in call_graph.call_sites.values() {
+            for cs in sites {
+                let Some(caller_taint) = taint.get(&cs.caller) else {
+                    continue;
+                };
+                let caller_body = if cs.caller.is_local() && tcx.is_mir_available(cs.caller) {
+                    Some(tcx.optimized_mir(cs.caller))
+                } else {
+                    None
+                };
+                for (i, arg) in cs.arg_locals.iter().enumerate() {
+                    if let Some(a) = arg {
+                        if caller_taint.contains(a) {
+                            let arg_sender_like = caller_body
+                                .and_then(|b| b.local_decls.get(*a))
+                                .map(|d| analysis::ty_is_sender_like(tcx, d.ty))
+                                .unwrap_or(false);
+                            if arg_sender_like {
+                                seeds
+                                    .entry(cs.callee)
+                                    .or_default()
+                                    .param_locals
+                                    .insert(Local::from_usize(i + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Capture wiring: a sender-tainted capture `k` taints upvar index
+        //     `k` of the closure — again only if the captured value has a
+        //     sender-compatible type.
+        for (caller, closure_def, caps) in &closure_caps {
+            let Some(caller_taint) = taint.get(caller) else {
+                continue;
+            };
+            let caller_body = if caller.is_local() && tcx.is_mir_available(*caller) {
+                Some(tcx.optimized_mir(*caller))
+            } else {
+                None
+            };
+            for (k, cap) in caps.iter().enumerate() {
+                if let Some(c) = cap {
+                    if caller_taint.contains(c) {
+                        let cap_sender_like = caller_body
+                            .and_then(|b| b.local_decls.get(*c))
+                            .map(|d| analysis::ty_is_sender_like(tcx, d.ty))
+                            .unwrap_or(false);
+                        if cap_sender_like {
+                            seeds
+                                .entry(*closure_def)
+                                .or_default()
+                                .upvar_indices
+                                .insert(k);
+                        }
+                    }
+                }
+            }
+        }
+
+        if seeds == before {
+            break;
+        }
+    }
+
+    // 3. Final detection pass with stable seeds (this is what logs findings).
+    for &n in &nodes {
+        if !n.is_local() || !tcx.is_mir_available(n) {
+            continue;
+        }
+        let body = tcx.optimized_mir(n);
+        let s = seeds.get(&n).cloned().unwrap_or_default();
+        let _ = analysis::analyze_function(tcx, body, &tcx.def_path_str(n), &s, &mut inventory);
+    }
 }
