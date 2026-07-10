@@ -9,6 +9,7 @@ extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
+extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 
@@ -22,6 +23,7 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::analysis::SenderComparison;
 use crate::storage_inventory::StorageInventory;
 
 /// rustc 1.98.0-nightly (c397dae80 2026-07-02)
@@ -134,7 +136,26 @@ fn run_analysis(args: &Vec<String>) {
                 return;
             };
             let call_graph = call_graph::CallGraph::build_from_root(tcx, root);
-            find_auth_states(tcx, &call_graph, storage_inventory);
+            let fn_comparisons = find_auth_states(tcx, &call_graph, storage_inventory);
+
+            let always_checks = analysis::compute_always_checks(tcx, &call_graph, &fn_comparisons);
+
+            // Sorted for deterministic output despite HashMap iteration order.
+            let mut checking: Vec<String> = always_checks
+                .iter()
+                .filter_map(|(def_id, &ok)| ok.then(|| tcx.def_path_str(*def_id)))
+                .collect();
+            checking.sort();
+
+            eprintln!(
+                "\n[3] Always-checking functions: {}/{}",
+                checking.len(),
+                always_checks.len()
+            );
+            for name in &checking {
+                eprintln!("\t{}", name);
+            }
+
         });
     });
 }
@@ -148,7 +169,11 @@ fn run_analysis(args: &Vec<String>) {
 /// propagate sender-tainted actuals into the callee's formal parameters and
 /// sender-tainted captures into the closure's upvars, until the seeds stop
 /// growing. The final detection pass then runs with stable seeds.
-fn find_auth_states(tcx: TyCtxt, call_graph: &call_graph::CallGraph, mut inventory: StorageInventory) {
+fn find_auth_states(
+    tcx: TyCtxt,
+    call_graph: &call_graph::CallGraph,
+    mut inventory: StorageInventory,
+) -> HashMap<DefId, Vec<SenderComparison>> {
     // 1. Analysis set: call-graph nodes plus every (possibly nested) closure
     //    created via an aggregate. Closures are not call edges but still need
     //    to be tainted and analysed. `closure_caps` records, per closure
@@ -265,6 +290,8 @@ fn find_auth_states(tcx: TyCtxt, call_graph: &call_graph::CallGraph, mut invento
         }
     }
 
+    let mut fn_comparisons: HashMap<DefId, Vec<SenderComparison>> = HashMap::new();
+
     // 3. Final detection pass with stable seeds (this is what logs findings).
     for &n in &nodes {
         if !n.is_local() || !tcx.is_mir_available(n) {
@@ -272,10 +299,11 @@ fn find_auth_states(tcx: TyCtxt, call_graph: &call_graph::CallGraph, mut invento
         }
         let body = tcx.optimized_mir(n);
         let s = seeds.get(&n).cloned().unwrap_or_default();
-        let _ = analysis::analyze_function(tcx, body, &tcx.def_path_str(n), &s, &mut inventory);
+        let comparisons =
+            analysis::analyze_function(tcx, body, &tcx.def_path_str(n), &s, &mut inventory);
+        fn_comparisons.insert(n, comparisons);
     }
 
-    // 4. Print the inventory only now — after `update_auth_state` has run for
-    //    every analysed function — so `[auth]` marks are actually visible.
     inventory.print_inventory();
+    fn_comparisons
 }

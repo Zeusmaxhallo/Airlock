@@ -2,7 +2,7 @@ use rustc_middle::{
     mir::{Body, Operand},
     ty::{TyCtxt, TyKind},
 };
-use rustc_span::def_id::DefId;
+use rustc_span::{def_id::DefId, sym};
 
 /// Check if the crate name of the given `def_id` matches the provided `name`.
 pub fn crate_name_is(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
@@ -110,4 +110,11 @@ pub fn is_storage_write_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 pub fn is_storage_load_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     crate_name_is(tcx, def_id, "cw_storage_plus")
         && matches!(tcx.item_name(def_id).as_str(), "load" | "may_load" | "get")
+}
+
+
+
+/// Returns `true` if `def_id` identifies the `Result` enum.
+pub fn is_result_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.is_diagnostic_item(sym::Result, def_id)
 }

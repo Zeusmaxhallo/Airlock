@@ -103,6 +103,10 @@ impl CallGraph {
         let mut queue = VecDeque::new();
         visited.insert(root);
         queue.push_back(root);
+        // The root must be a node even if none of its calls resolve —
+        // otherwise crates whose `execute` has no resolvable callees are
+        // skipped by every analysis stage.
+        graph.nodes.insert(root);
 
         while let Some(caller_id) = queue.pop_front() {
             if !caller_id.is_local() || !tcx.is_mir_available(caller_id) {
