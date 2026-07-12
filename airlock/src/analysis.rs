@@ -1310,7 +1310,7 @@ pub fn compute_return_taint_params<'tcx>(
                 seed.insert(Local::from_usize(i + 1));
                 let (tainted, _origin) = propagate_taint_forward(body, &seed, &callee_at, &summary);
 
-                if ret_locals.iter().any(|rl| tainted.contains(rl)){
+                if ret_locals.iter().any(|rl| tainted.contains(rl)) {
                     flow.insert(i);
                     changed = true;
                 }
@@ -1322,7 +1322,6 @@ pub fn compute_return_taint_params<'tcx>(
         if !changed {
             break;
         }
-
     }
 
     summary
@@ -1584,4 +1583,99 @@ fn rvalue_locals(rvalue: &Rvalue<'_>) -> Vec<Local> {
     }
 
     locals
+}
+
+
+/// Computes, for every function in the call graph, whether it is entered
+/// only after an authorization check has already occurred in the caller
+/// (top-down gating context, §5.1, Meilenstein 4).
+///
+/// `entry_checked[f]` is the meet (∧) over all call sites `C → f` of the
+/// gating state at that call site in `C` (analysed under `C`'s own
+/// context). The root (`execute`) is an external entry point and is
+/// therefore never entry-checked. Solved as a greatest fixpoint:
+/// optimistic initial value `true` for non-root functions, monotonically
+/// lowered to `false` as ungated call paths are discovered (terminates,
+/// handles recursion).
+pub fn compute_entry_checked<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    call_graph: &CallGraph,
+    root: DefId,
+    fn_comparisons: &HashMap<DefId, Vec<SenderComparison>>,
+    always_checks: &HashMap<DefId, bool>,
+) -> HashMap<DefId, bool> {
+    let mut entry: HashMap<DefId, bool> =
+        call_graph.nodes.iter().map(|&n| (n, n != root)).collect();
+
+    // `call_graph.call_sites` is keyed by CALLEE; both the gating and the
+    // per-call-site meet below need the sites *inside* the caller.
+    let mut sites_by_caller: HashMap<DefId, Vec<&CallSite>> = HashMap::new();
+    for cs in call_graph.call_sites.values().flatten() {
+        sites_by_caller.entry(cs.caller).or_default().push(cs);
+    }
+
+    loop {
+        let mut changed = false;
+
+        let mut contribution: HashMap<DefId, bool> = HashMap::new();
+
+        for &caller in &call_graph.nodes {
+            if !caller.is_local() || !tcx.is_mir_available(caller) {
+                continue;
+            }
+
+            let body = tcx.optimized_mir(caller);
+            let comparisons = fn_comparisons.get(&caller).cloned().unwrap_or_default();
+            let sites = sites_by_caller
+                .get(&caller)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            let ok_points = ok_return_points(tcx, body);
+            let ok_blocks: HashSet<BasicBlock> = ok_points.iter().map(|l| l.block).collect();
+
+            let check_locations = gating_check_locations(
+                tcx,
+                body,
+                &comparisons,
+                sites,
+                always_checks,
+                &ok_blocks,
+            );
+            let ctx = if entry.get(&caller).copied().unwrap_or(false) {
+                AuthState::Checked
+            } else {
+                AuthState::Unchecked
+            };
+
+            let (gating, _always) =
+                solve_auth_gating(tcx, body, check_locations, ctx, &ok_points);
+
+            for cs in sites {
+                let gated_here = gating
+                    .get(&cs.location.block)
+                    .map(|s| *s == AuthState::Checked)
+                    .unwrap_or(false);
+                let acc = contribution.entry(cs.callee).or_insert(true);
+                *acc = *acc && gated_here;
+            }
+        }
+
+        for (&callee, &gated) in &contribution {
+            if callee == root {
+                continue;
+            }
+            if entry.get(&callee).copied().unwrap_or(true) != gated {
+                entry.insert(callee, gated);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    entry.insert(root, false);
+    entry
 }

@@ -184,6 +184,35 @@ fn run_analysis(args: &Vec<String>) {
                     .join(", ");
                 eprintln!("\t{} <- param [{}]", name, list);
             }
+
+            let entry_checked = analysis::compute_entry_checked(
+                tcx,
+                &call_graph,
+                root,
+                &fn_comparisons,
+                &always_checks,
+            );
+
+            // Local functions only — non-local nodes (String::clone,
+            // addr_validate, …) are vacuously entry-checked whenever all
+            // their call sites happen to be gated and would drown the list.
+            // Sorted for deterministic output despite HashMap iteration order.
+            let mut gated: Vec<String> = entry_checked
+                .iter()
+                .filter_map(|(def_id, &ok)| {
+                    (ok && def_id.is_local()).then(|| tcx.def_path_str(*def_id))
+                })
+                .collect();
+            gated.sort();
+
+            eprintln!(
+                "\n[5] Entry-checked functions (local): {}/{}",
+                gated.len(),
+                entry_checked.len()
+            );
+            for name in &gated {
+                eprintln!("\t{}", name);
+            }
         });
     });
 }
