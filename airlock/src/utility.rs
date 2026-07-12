@@ -1,6 +1,6 @@
+
 use rustc_middle::{
-    mir::{Body, Operand},
-    ty::{TyCtxt, TyKind},
+    mir::{Body, Operand}, ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::{def_id::DefId, sym};
 
@@ -117,4 +117,59 @@ pub fn is_storage_load_fn(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 /// Returns `true` if `def_id` identifies the `Result` enum.
 pub fn is_result_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.is_diagnostic_item(sym::Result, def_id)
+}
+
+
+
+/// Returns `true` if `ty` is the standard `core::result::Result<_, _>` type.
+pub fn is_result_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    matches!(ty.kind(), TyKind::Adt(adt_def, _)
+        if tcx.is_diagnostic_item(sym::Result, adt_def.did()))
+}
+
+
+/// Returns whether `ty` is a CosmWasm framework type.
+///
+/// Framework types (`Deps`, `DepsMut`, `OwnedDeps`, `MessageInfo`, `Env`)
+/// and the `dyn Storage` trait object are considered trusted and therefore
+/// excluded from taint seeding. Any reference layers are stripped before
+/// performing the check.
+pub fn is_framework_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let mut t = ty;
+    while let TyKind::Ref(_, inner, _) = t.kind() {
+        t = *inner;
+    }
+    match t.kind() {
+        TyKind::Adt(adt_def, _) => {
+            let did = adt_def.did();
+            crate_name_is(tcx, did, "cosmwasm_std")
+                && matches!(
+                    tcx.item_name(did).as_str(),
+                    "MessageInfo" | "Deps" | "DepsMut" | "OwnedDeps" | "Env"
+                )
+        }
+        TyKind::Dynamic(preds, ..) => preds
+            .principal_def_id()
+            .map_or(false, |d| {
+                crate_name_is(tcx, d, "cosmwasm_std") && item_name_is(tcx, d, "Storage")
+            }),
+        _ => false,
+    }
+}
+
+/// is item_name of `def_id` equal `name`.
+pub fn item_name_is(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    tcx.item_name(def_id).as_str() == name
+}
+
+/// Returns `true` if `ty` (through any reference layers) is
+/// `cosmwasm_std::MessageInfo`.
+pub fn is_message_info_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let mut t = ty;
+    while let TyKind::Ref(_, inner, _) = t.kind() {
+        t = *inner;
+    }
+    matches!(t.kind(), TyKind::Adt(adt_def, _)
+        if crate_name_is(tcx, adt_def.did(), "cosmwasm_std")
+            && item_name_is(tcx, adt_def.did(), "MessageInfo"))
 }

@@ -1,11 +1,19 @@
 use crate::{
-    call_graph::{CallGraph, CallSite}, storage_inventory::AuthStateVariable, utility::{self, callee_def_id, is_forwarding_glue_fn, is_result_def, is_storage_load_fn, normalize_ty_str},
+    call_graph::{CallGraph, CallSite},
+    storage_inventory::AuthStateVariable,
+    utility::{
+        self, callee_def_id, is_forwarding_glue_fn, is_framework_ty, is_result_def, is_result_ty,
+        is_storage_load_fn, normalize_ty_str,
+    },
 };
-use rustc_hir::{def::DefKind, def_id::DefId};
+use rustc_hir::{
+    def::DefKind,
+    def_id::{self, DefId},
+};
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BinOp, Body, Local, Location, Operand, Place, PlaceElem, Rvalue,
-        Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
+        AggregateKind, BasicBlock, BinOp, Body, BorrowKind, Local, Location, Operand, Place,
+        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -1229,28 +1237,351 @@ fn solve_auth_gating<'tcx>(
 fn ok_return_points<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<Location> {
     let mut points = Vec::new();
 
-    for (block, data) in body.basic_blocks.iter_enumerated(){
-        for (statement_idx, stmt) in data.statements.iter().enumerate(){
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_idx, stmt) in data.statements.iter().enumerate() {
             let StatementKind::Assign(assign) = &stmt.kind else {
                 continue;
             };
             let (place, rvalue) = assign.as_ref();
 
-            if place.local.as_usize() != 0 || !place.projection.is_empty(){
+            if place.local.as_usize() != 0 || !place.projection.is_empty() {
                 continue;
             }
 
-            if let Rvalue::Aggregate(kind, _ ) = rvalue {
-                if let AggregateKind::Adt(def_id, variant_index, .. ) = kind.as_ref(){
+            if let Rvalue::Aggregate(kind, _) = rvalue {
+                if let AggregateKind::Adt(def_id, variant_index, ..) = kind.as_ref() {
                     // 'Result::Ok' is variant 0
-                    if variant_index.as_usize() == 0 && is_result_def(tcx, *def_id){
-                        points.push(Location { block, statement_index: statement_idx })
+                    if variant_index.as_usize() == 0 && is_result_def(tcx, *def_id) {
+                        points.push(Location {
+                            block,
+                            statement_index: statement_idx,
+                        })
                     }
                 }
             }
         }
     }
 
-
     points
+}
+
+/// Computes, for every function in the call graph, the set of parameter
+/// positions (0-based) whose taint reaches the function's return value
+pub fn compute_return_taint_params<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    call_graph: &CallGraph,
+) -> HashMap<DefId, HashSet<usize>> {
+    let mut summary: HashMap<DefId, HashSet<usize>> = HashMap::new();
+
+    for &f in &call_graph.nodes {
+        if f.is_local() && tcx.is_mir_available(f) {
+            summary.insert(f, HashSet::new());
+        }
+    }
+
+    // `call_graph.call_sites` is keyed by CALLEE; here we need the call
+    // sites *inside* a function, i.e. grouped by caller.
+    let mut sites_by_caller: HashMap<DefId, Vec<&CallSite>> = HashMap::new();
+    for cs in call_graph.call_sites.values().flatten() {
+        sites_by_caller.entry(cs.caller).or_default().push(cs);
+    }
+
+    loop {
+        let mut changed = false;
+
+        for &f in &call_graph.nodes {
+            if !f.is_local() || !tcx.is_mir_available(f) {
+                continue;
+            }
+            let body = tcx.optimized_mir(f);
+            let sites = sites_by_caller.get(&f).map(|v| v.as_slice()).unwrap_or(&[]);
+            let callee_at = callee_locations(sites);
+            let ret_locals = return_value_locals(tcx, body);
+            let mut flow = summary.get(&f).cloned().unwrap_or_default();
+
+            for i in 0..body.arg_count {
+                if flow.contains(&i) {
+                    continue;
+                }
+                if is_framework_param(tcx, body, Local::from_usize(i + 1)) {
+                    continue;
+                }
+                let mut seed = HashSet::new();
+                seed.insert(Local::from_usize(i + 1));
+                let (tainted, _origin) = propagate_taint_forward(body, &seed, &callee_at, &summary);
+
+                if ret_locals.iter().any(|rl| tainted.contains(rl)){
+                    flow.insert(i);
+                    changed = true;
+                }
+            }
+
+            summary.insert(f, flow);
+        }
+
+        if !changed {
+            break;
+        }
+
+    }
+
+    summary
+}
+
+/// Maps each call-terminator location to the resolved callee, derived
+/// from the call graph's recorded call sites.
+fn callee_locations(call_sites: &[&CallSite]) -> HashMap<Location, DefId> {
+    call_sites
+        .iter()
+        .map(|cs| (cs.location, cs.callee))
+        .collect()
+}
+
+/// The locals that constitute a function's *successful* return value:
+/// the operands of `_0 = Ok(..)` for `Result`-returning functions, or
+/// `_0` itself otherwise.
+fn return_value_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
+    let return_place = Local::from_usize(0);
+    let ret_ty = body.local_decls[return_place].ty;
+
+    if !is_result_ty(tcx, ret_ty) {
+        let mut locals = HashSet::new();
+        locals.insert(return_place);
+        return locals;
+    }
+
+    let mut locals = HashSet::new();
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in data.statements.iter() {
+            let StatementKind::Assign(assign) = &stmt.kind else {
+                continue;
+            };
+            let (place, rvalue) = assign.as_ref();
+            if place.local.as_usize() != 0 || !place.projection.is_empty() {
+                continue;
+            }
+            if let Rvalue::Aggregate(kind, operands) = rvalue {
+                if let AggregateKind::Adt(def_id, variant_index, ..) = kind.as_ref() {
+                    if variant_index.as_u32() == 0 && is_result_def(tcx, *def_id) {
+                        for op in operands.iter() {
+                            if let Some(l) = operand_local(op) {
+                                locals.insert(l);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: no `_0 = Ok(..)` aggregate found — tail-call returns
+    // (`fn h(x) -> Result<T> { inner(x) }`, `.map(..)` tails) write `_0`
+    // directly from a call. Track `_0` itself; this over-approximates by
+    // including Err flows, but errs in the conservative direction.
+    if locals.is_empty() {
+        locals.insert(return_place);
+    }
+
+    locals
+}
+
+/// Params excluded from return-taint seeding: framework plumbing
+/// (`Deps`, `Env`, `dyn Storage`, …). `MessageInfo` is deliberately NOT
+/// excluded even though `is_framework_ty` classifies it as framework —
+/// it carries `info.sender`, and helpers that take the whole `info` and
+/// return sender-derived data (astroport ownership-helper class) are
+/// exactly the flows the sender-taint consumer needs.
+fn is_framework_param<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, local: Local) -> bool {
+    let ty = body.local_decls[local].ty;
+    if utility::is_message_info_ty(tcx, ty) {
+        return false;
+    }
+    is_framework_ty(tcx, ty)
+}
+
+fn propagate_taint_forward<'tcx>(
+    body: &Body<'tcx>,
+    seed: &HashSet<Local>,
+    callee_at: &HashMap<Location, DefId>,
+    return_taint_params: &HashMap<DefId, HashSet<usize>>,
+) -> (HashSet<Local>, HashMap<Local, Local>) {
+    let mut tainted: HashSet<Local> = HashSet::new();
+    let mut origin: HashMap<Local, Local> = HashMap::new();
+
+    for &local in seed {
+        tainted.insert(local);
+        origin.insert(local, local);
+    }
+    if tainted.is_empty() {
+        return (tainted, origin);
+    }
+
+    let (borrow_of, mut_borrow) = build_borrow_maps(body);
+
+    let mark = |local: Local,
+                src: Local,
+                tainted: &mut HashSet<Local>,
+                origin: &mut HashMap<Local, Local>|
+     -> bool {
+        let newly = tainted.insert(local);
+        origin.entry(local).or_insert(src);
+        newly
+    };
+
+    loop {
+        let mut changed = false;
+
+        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
+            for stmt in bb_data.statements.iter() {
+                if let StatementKind::Assign(assign) = &stmt.kind {
+                    let (lhs, rvalue) = assign.as_ref();
+                    if let Some(src) = rvalue_locals(rvalue)
+                        .into_iter()
+                        .find(|l| tainted.contains(l))
+                        .and_then(|l| origin.get(&l).copied())
+                    {
+                        changed |= mark(lhs.local, src, &mut tainted, &mut origin);
+                    }
+                }
+            }
+
+            if let TerminatorKind::Call {
+                args, destination, ..
+            } = &bb_data.terminator().kind
+            {
+                let location = Location {
+                    block: bb,
+                    statement_index: bb_data.statements.len(),
+                };
+                let arg_locals: Vec<Local> =
+                    args.iter().filter_map(|a| operand_local(&a.node)).collect();
+
+                let arg_taint: Vec<Option<Local>> = arg_locals
+                    .iter()
+                    .map(|l| {
+                        if tainted.contains(l) {
+                            origin.get(l).copied().or(Some(*l))
+                        } else if let Some(base) = borrow_of.get(l) {
+                            if tainted.contains(base) {
+                                origin.get(base).copied().or(Some(*base))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let first_src = arg_taint.iter().copied().flatten().next();
+
+                let dest_src = match callee_at
+                    .get(&location)
+                    .and_then(|callee| return_taint_params.get(callee))
+                {
+                    Some(flow) => arg_taint
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, s)| if flow.contains(&i) { *s } else { None }),
+                    None => first_src,
+                };
+
+                if let Some(src) = dest_src {
+                    changed |= mark(destination.local, src, &mut tainted, &mut origin);
+                }
+
+                if let Some(src) = first_src {
+                    for l in arg_locals.iter() {
+                        if mut_borrow.contains(l) {
+                            if let Some(base) = borrow_of.get(l).copied() {
+                                changed |= mark(base, src, &mut tainted, &mut origin);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    (tainted, origin)
+}
+
+/// Maps each reference local to the local it borrows, recording whether
+/// the borrow is mutable.
+fn build_borrow_maps<'tcx>(body: &Body<'tcx>) -> (HashMap<Local, Local>, HashSet<Local>) {
+    let mut borrow_of: HashMap<Local, Local> = HashMap::new();
+    let mut mut_borrow: HashSet<Local> = HashSet::new();
+
+    for (_, bb_data) in body.basic_blocks.iter_enumerated() {
+        for stmt in bb_data.statements.iter() {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (lhs, rvalue) = assign.as_ref();
+                match rvalue {
+                    Rvalue::Ref(_, kind, place) => {
+                        borrow_of.insert(lhs.local, place.local);
+                        if matches!(kind, BorrowKind::Mut { .. }) {
+                            mut_borrow.insert(lhs.local);
+                        }
+                    }
+                    // Raw pointers are treated conservatively as mutable borrows.
+                    Rvalue::RawPtr(_, place) => {
+                        borrow_of.insert(lhs.local, place.local);
+                        mut_borrow.insert(lhs.local);
+                    }
+                    // Reborrow through a copy/move of an existing reference.
+                    Rvalue::Use(Operand::Copy(src), _) | Rvalue::Use(Operand::Move(src), _) => {
+                        if let Some(base) = borrow_of.get(&src.local).copied() {
+                            borrow_of.insert(lhs.local, base);
+                            if mut_borrow.contains(&src.local) {
+                                mut_borrow.insert(lhs.local);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (borrow_of, mut_borrow)
+}
+
+/// Collects the locals read by an `Rvalue` (operands and source places).
+fn rvalue_locals(rvalue: &Rvalue<'_>) -> Vec<Local> {
+    let mut locals = Vec::new();
+    let mut push_op = |op: &Operand<'_>| {
+        if let Some(l) = operand_local(op) {
+            locals.push(l);
+        }
+    };
+
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::Repeat(op, _)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::UnaryOp(_, op) => push_op(op),
+        // NB: no `Rvalue::Len` — removed from MIR (rust-lang/rust#134330);
+        // slice lengths are `UnaryOp(PtrMetadata, ..)`, covered above.
+        Rvalue::Ref(_, _, place)
+        | Rvalue::RawPtr(_, place)
+        | Rvalue::Discriminant(place)
+        | Rvalue::CopyForDeref(place) => locals.push(place.local),
+        Rvalue::BinaryOp(_, operands) => {
+            let (a, b) = operands.as_ref();
+            push_op(a);
+            push_op(b);
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands.iter() {
+                push_op(op);
+            }
+        }
+        _ => {}
+    }
+
+    locals
 }

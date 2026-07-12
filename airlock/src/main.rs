@@ -156,6 +156,34 @@ fn run_analysis(args: &Vec<String>) {
                 eprintln!("\t{}", name);
             }
 
+            let return_taint_params = analysis::compute_return_taint_params(tcx, &call_graph);
+
+            // Non-empty entries only, sorted — deterministic output
+            // despite HashMap iteration order.
+            let mut flows: Vec<(String, Vec<usize>)> = return_taint_params
+                .iter()
+                .filter(|(_, params)| !params.is_empty())
+                .map(|(def_id, params)| {
+                    let mut p: Vec<usize> = params.iter().copied().collect();
+                    p.sort();
+                    (tcx.def_path_str(*def_id), p)
+                })
+                .collect();
+            flows.sort();
+
+            eprintln!(
+                "\n[4] Return-tainted-by-param functions: {}/{}",
+                flows.len(),
+                return_taint_params.len()
+            );
+            for (name, params) in &flows {
+                let list = params
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("\t{} <- param [{}]", name, list);
+            }
         });
     });
 }
