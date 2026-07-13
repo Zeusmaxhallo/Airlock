@@ -967,6 +967,10 @@ fn gating_check_locations<'tcx>(
     ok_blocks: &HashSet<BasicBlock>,
 ) -> HashSet<Location> {
     let mut locations = effective_guard_locations(tcx, body, comparisons, ok_blocks);
+    // Lücke 1: recover disjunctive gates (`sender != owner && sender != manager`)
+    // that the location-based divergence criterion cannot see, by marking
+    // convergence blocks reached only through authorizing comparison edges.
+    locations.extend(authorized_gate_locations(tcx, body, comparisons));
     for cs in call_sites {
         if always_checks.get(&cs.callee).copied().unwrap_or(false) {
             locations.insert(cs.location);
@@ -997,6 +1001,46 @@ fn effective_guard_locations<'tcx>(
         return HashSet::new();
     }
 
+    let alias = build_comparison_alias_map(tcx, body);
+    let resolve = |start: Local| resolve_alias_chain(&alias, start);
+
+    let mut effective = HashSet::new();
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::SwitchInt { discr, targets } = &data.terminator().kind else {
+            continue;
+        };
+        let Some(discr_local) = operand_local(discr) else {
+            continue;
+        };
+        let matched = resolve(discr_local)
+            .into_iter()
+            .find_map(|l| result_to_loc.get(&l).copied());
+        let Some(loc) = matched else {
+            continue;
+        };
+
+        let all: Vec<BasicBlock> = targets.all_targets().to_vec();
+        let has_aborting_arm = all.iter().any(|&t| {
+            let reach = reachable_from(body, t);
+            !ok_blocks.iter().any(|ob| reach.contains(ob))
+        });
+        if has_aborting_arm {
+            effective.insert(loc);
+        }
+    }
+
+    effective
+}
+
+/// Builds the alias map used to trace a `SwitchInt` discriminant back to the
+/// local that holds a sender-comparison result: `Use`/`UnaryOp` copies,
+/// `Discriminant` reads (for `?` / `match`), and forwarding-glue calls
+/// (`x?` routing through `Try::branch`). Shared by
+/// [`effective_guard_locations`] and [`authorized_gate_locations`].
+fn build_comparison_alias_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> HashMap<Local, Local> {
     let mut alias: HashMap<Local, Local> = HashMap::new();
     for (_, data) in body.basic_blocks.iter_enumerated() {
         for stmt in data.statements.iter() {
@@ -1037,47 +1081,117 @@ fn effective_guard_locations<'tcx>(
             }
         }
     }
-    let resolve = |start: Local| -> Vec<Local> {
-        let mut chain = vec![start];
-        let mut current = start;
-        let mut seen = HashSet::new();
-        seen.insert(start);
-        while let Some(&next) = alias.get(&current) {
-            if !seen.insert(next) {
-                break;
-            }
-            chain.push(next);
-            current = next;
-        }
-        chain
-    };
+    alias
+}
 
-    let mut effective = HashSet::new();
-    for (_, data) in body.basic_blocks.iter_enumerated() {
+/// Follows the alias chain starting at `start` (inclusive), stopping at the
+/// first cycle. Returns every local the discriminant may alias, so a
+/// comparison result can be recovered even through copies and glue.
+fn resolve_alias_chain(alias: &HashMap<Local, Local>, start: Local) -> Vec<Local> {
+    let mut chain = vec![start];
+    let mut current = start;
+    let mut seen = HashSet::new();
+    seen.insert(start);
+    while let Some(&next) = alias.get(&current) {
+        if !seen.insert(next) {
+            break;
+        }
+        chain.push(next);
+        current = next;
+    }
+    chain
+}
+
+/// Lücke 1 (edge-sensitive gating): a disjunctive authorization check such as
+/// `if sender != owner && sender != manager { return Err(..) }` lets the
+/// authorized caller (owner *or* manager) through a short-circuit *bypass
+/// edge* of the `&&`, not through a single dominating guard location. The
+/// location-based [`effective_guard_locations`] therefore misses it: the
+/// first comparison has no aborting arm (both of its arms can still reach an
+/// Ok-return), so it is not counted, and the owner path reaches the storage
+/// write as `Unchecked`.
+///
+/// This recovers those gates by reasoning about *edges*. For each equality
+/// sender comparison feeding a boolean `SwitchInt` it determines the
+/// authorizing edge — for `!=` the false edge (`sender == principal`), for
+/// `==` the true edge — and marks the entry of any block whose predecessors
+/// are *all* authorizing edges. That "all predecessors authorized" condition
+/// is what keeps the marking sound: a block reachable by even one
+/// unauthorized path is never marked, so no vulnerability can be hidden — a
+/// misclassification can only ever fail towards a false positive.
+fn authorized_gate_locations<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    comparisons: &[SenderComparison],
+) -> HashSet<Location> {
+    let mut result_to_op: HashMap<Local, BinOp> = HashMap::new();
+    for cmp in comparisons {
+        if matches!(cmp.op, BinOp::Eq | BinOp::Ne) {
+            if let Some(res) = comparison_result_local(body, cmp) {
+                result_to_op.insert(res, cmp.op);
+            }
+        }
+    }
+    if result_to_op.is_empty() {
+        return HashSet::new();
+    }
+
+    let alias = build_comparison_alias_map(tcx, body);
+
+    // Authorizing edges (pred -> succ) of boolean sender comparisons.
+    let mut authorized_edges: HashSet<(BasicBlock, BasicBlock)> = HashSet::new();
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::SwitchInt { discr, targets } = &data.terminator().kind else {
             continue;
         };
+        // Only genuine boolean branches (exactly two successors). Multi-way
+        // discriminant switches (`match` over an enum) are not equality
+        // guards and must not be classified here.
+        if targets.all_targets().len() != 2 {
+            continue;
+        }
         let Some(discr_local) = operand_local(discr) else {
             continue;
         };
-        let matched = resolve(discr_local)
+        let matched_op = resolve_alias_chain(&alias, discr_local)
             .into_iter()
-            .find_map(|l| result_to_loc.get(&l).copied());
-        let Some(loc) = matched else {
+            .find_map(|l| result_to_op.get(&l).copied());
+        let Some(op) = matched_op else {
             continue;
         };
-
-        let all: Vec<BasicBlock> = targets.all_targets().to_vec();
-        let has_aborting_arm = all.iter().any(|&t| {
-            let reach = reachable_from(body, t);
-            !ok_blocks.iter().any(|ob| reach.contains(ob))
-        });
-        if has_aborting_arm {
-            effective.insert(loc);
-        }
+        // Boolean `SwitchInt`: value 0 is the `false` edge, `otherwise` the
+        // `true` edge. `sender == principal` is the authorizing outcome — the
+        // false edge for `!=`, the true edge for `==`.
+        let authorized_succ = match op {
+            BinOp::Ne => targets.target_for_value(0),
+            BinOp::Eq => targets.otherwise(),
+            _ => continue,
+        };
+        authorized_edges.insert((bb, authorized_succ));
+    }
+    if authorized_edges.is_empty() {
+        return HashSet::new();
     }
 
-    effective
+    let predecessors = body.basic_blocks.predecessors();
+    let candidates: HashSet<BasicBlock> = authorized_edges.iter().map(|&(_, t)| t).collect();
+
+    let mut result = HashSet::new();
+    for t in candidates {
+        let preds = &predecessors[t];
+        if preds.is_empty() {
+            continue;
+        }
+        // Sound only if *every* way into `t` is an authorizing edge.
+        let all_authorized = preds.iter().all(|&p| authorized_edges.contains(&(p, t)));
+        if all_authorized {
+            result.insert(Location {
+                block: t,
+                statement_index: 0,
+            });
+        }
+    }
+    result
 }
 
 fn comparison_result_local<'tcx>(body: &Body<'tcx>, cmp: &SenderComparison) -> Option<Local> {
