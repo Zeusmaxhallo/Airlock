@@ -20,7 +20,7 @@ pub struct CallGraph {
 pub struct CallSite {
     /// Location of the `Call` terminator in the caller.
     pub location: Location,
-    /// Function that contains this call 
+    /// Function that contains this call
     pub caller: DefId,
     /// Resolved callee.
     pub callee: DefId,
@@ -136,6 +136,31 @@ impl CallGraph {
         );
 
         graph
+    }
+
+    /// Returns, for each function reachable from `root`, a representative
+    /// (shortest, BFS) call path `root → … → f`. Used for the call-string
+    /// in reported findings.
+    pub fn paths_from_root(&self, root: DefId) -> HashMap<DefId, Vec<DefId>> {
+        let mut paths: HashMap<DefId, Vec<DefId>> = HashMap::new();
+        paths.insert(root, vec![root]);
+
+        let mut queue = VecDeque::new();
+        queue.push_back(root);
+
+        while let Some(current) = queue.pop_front() {
+            let current_path = paths[&current].clone();
+            for &callee in self.callees(current) {
+                if !paths.contains_key(&callee) {
+                    let mut path = current_path.clone();
+                    path.push(callee);
+                    paths.insert(callee, path);
+                    queue.push_back(callee);
+                }
+            }
+        }
+
+        paths
     }
 }
 

@@ -136,7 +136,10 @@ fn run_analysis(args: &Vec<String>) {
                 return;
             };
             let call_graph = call_graph::CallGraph::build_from_root(tcx, root);
-            let fn_comparisons = find_auth_states(tcx, &call_graph, storage_inventory);
+            // `find_auth_states` marks auth-state storage items (stage 2) and
+            // returns the enriched inventory so later stages can read it.
+            let (fn_comparisons, storage_inventory) =
+                find_auth_states(tcx, &call_graph, storage_inventory);
 
             let always_checks = analysis::compute_always_checks(tcx, &call_graph, &fn_comparisons);
 
@@ -213,6 +216,76 @@ fn run_analysis(args: &Vec<String>) {
             for name in &gated {
                 eprintln!("\t{}", name);
             }
+
+
+            // `call_graph.call_sites` is keyed by CALLEE; analyze_access_control
+            // needs the sites *inside* each function, i.e. grouped by caller.
+            let mut sites_by_caller: HashMap<DefId, Vec<&call_graph::CallSite>> = HashMap::new();
+            for cs in call_graph.call_sites.values().flatten() {
+                sites_by_caller.entry(cs.caller).or_default().push(cs);
+            }
+
+            let mut all_findings: Vec<(String, analysis::AccessControlFinding)> = Vec::new();
+            for node in call_graph.nodes.iter() {
+                if !node.is_local() || !tcx.is_mir_available(*node) {
+                    continue;
+                }
+                let body = tcx.optimized_mir(*node);
+                let comparisons = fn_comparisons.get(node).cloned().unwrap_or_default();
+                let sites = sites_by_caller.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
+                let findings = analysis::analyze_access_control(
+                    tcx,
+                    body,
+                    &storage_inventory,
+                    &comparisons,
+                    sites,
+                    &always_checks,
+                    &return_taint_params,
+                    entry_checked.get(node).copied().unwrap_or(false),
+                );
+                let fname = tcx.def_path_str(*node);
+                for f in findings {
+                    all_findings.push((fname.clone(), f));
+                }
+            }
+
+            // Sort for deterministic output: by function, then sink block.
+            all_findings.sort_by(|a, b| {
+                a.0.cmp(&b.0).then(
+                    a.1.sink
+                        .location
+                        .block
+                        .as_usize()
+                        .cmp(&b.1.sink.location.block.as_usize()),
+                )
+            });
+
+            let vuln_count = all_findings.iter().filter(|(_, f)| f.is_vulnerability()).count();
+
+            eprintln!(
+                "\n=== Access-Control findings: {} sink(s), {} vulnerability(ies)",
+                all_findings.len(),
+                vuln_count
+            );
+            for (fname, f) in &all_findings {
+                // Classify: VULN = attacker-tainted write with no preceding
+                // auth check; otherwise note why it is benign.
+                let status = if f.is_vulnerability() {
+                    "VULN "
+                } else if f.gated {
+                    "gated"
+                } else {
+                    "clean"
+                };
+                let taint = match &f.taint {
+                    Some(src) => format!(" <- tainted by _{} : {}", src.param_local.as_usize(), src.param_ty),
+                    None => String::new(),
+                };
+                eprintln!(
+                    "\t[{}] {} writes {} @ {:?}{}",
+                    status, fname, f.sink.symbolic_name, f.sink.location, taint
+                );
+            }
         });
     });
 }
@@ -230,7 +303,7 @@ fn find_auth_states(
     tcx: TyCtxt,
     call_graph: &call_graph::CallGraph,
     mut inventory: StorageInventory,
-) -> HashMap<DefId, Vec<SenderComparison>> {
+) -> (HashMap<DefId, Vec<SenderComparison>>, StorageInventory) {
     // 1. Analysis set: call-graph nodes plus every (possibly nested) closure
     //    created via an aggregate. Closures are not call edges but still need
     //    to be tainted and analysed. `closure_caps` records, per closure
@@ -362,5 +435,5 @@ fn find_auth_states(
     }
 
     inventory.print_inventory();
-    fn_comparisons
+    (fn_comparisons, inventory)
 }

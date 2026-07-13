@@ -2,8 +2,8 @@ use crate::{
     call_graph::{CallGraph, CallSite},
     storage_inventory::AuthStateVariable,
     utility::{
-        self, callee_def_id, is_forwarding_glue_fn, is_framework_ty, is_result_def, is_result_ty,
-        is_storage_load_fn, normalize_ty_str,
+        self, callee_def_id, is_cosmwasm_addr, is_forwarding_glue_fn, is_framework_ty,
+        is_result_def, is_result_ty, is_storage_load_fn, is_storage_write_fn, normalize_ty_str,
     },
 };
 use rustc_hir::{
@@ -18,6 +18,7 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::{Analysis, Forward, JoinSemiLattice, fmt::DebugWithContext};
+use rustc_span::sym;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -1585,7 +1586,6 @@ fn rvalue_locals(rvalue: &Rvalue<'_>) -> Vec<Local> {
     locals
 }
 
-
 /// Computes, for every function in the call graph, whether it is entered
 /// only after an authorization check has already occurred in the caller
 /// (top-down gating context, §5.1, Meilenstein 4).
@@ -1634,22 +1634,15 @@ pub fn compute_entry_checked<'tcx>(
             let ok_points = ok_return_points(tcx, body);
             let ok_blocks: HashSet<BasicBlock> = ok_points.iter().map(|l| l.block).collect();
 
-            let check_locations = gating_check_locations(
-                tcx,
-                body,
-                &comparisons,
-                sites,
-                always_checks,
-                &ok_blocks,
-            );
+            let check_locations =
+                gating_check_locations(tcx, body, &comparisons, sites, always_checks, &ok_blocks);
             let ctx = if entry.get(&caller).copied().unwrap_or(false) {
                 AuthState::Checked
             } else {
                 AuthState::Unchecked
             };
 
-            let (gating, _always) =
-                solve_auth_gating(tcx, body, check_locations, ctx, &ok_points);
+            let (gating, _always) = solve_auth_gating(tcx, body, check_locations, ctx, &ok_points);
 
             for cs in sites {
                 let gated_here = gating
@@ -1678,4 +1671,284 @@ pub fn compute_entry_checked<'tcx>(
 
     entry.insert(root, false);
     entry
+}
+
+/// Outcome of the access-control analysis for one sensitive sink.
+#[derive(Debug, Clone)]
+pub struct AccessControlFinding {
+    pub sink: SensitiveSink,
+    /// `Some` if the written value is attacker-controlled (Schritt 4).
+    pub taint: Option<TaintSource>,
+    /// `true` if an authorization check precedes the sink on every path.
+    pub gated: bool,
+}
+
+impl AccessControlFinding {
+    /// A reportable vulnerability: a tainted write that is not gated by
+    /// a preceding authorization check.
+    pub fn is_vulnerability(&self) -> bool {
+        self.taint.is_some() && !self.gated
+    }
+}
+
+/// A write to an auth-guarded storage variable — the sensitive sink
+/// in the access control evasion vulnerability pattern.
+#[derive(Debug, Clone)]
+pub struct SensitiveSink {
+    pub location: Location,
+    /// The local holding the storage item (self / args[0] of the save call)
+    pub storage_item_local: Local,
+    /// Symbolic name resolved via the static-constant lookup (e.g., "OWNER")
+    pub symbolic_name: String,
+}
+
+/// A user-controlled value flowing into a sensitive sink. The taint
+/// originates from a function parameter of address type, i.e. an
+/// attacker-controlled `ExecuteMsg` field handed to the handler.
+#[derive(Debug, Clone)]
+pub struct TaintSource {
+    /// The parameter local from which the tainted value originates.
+    pub param_local: Local,
+    /// Normalized type of the originating parameter (e.g. "Addr", "Vec<String>").
+    pub param_ty: String,
+    /// The sink whose written value is tainted.
+    pub sink_location: Location,
+}
+
+pub fn analyze_access_control<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    inventory: &StorageInventory,
+    comparisons: &[SenderComparison],
+    call_sites: &[&CallSite],
+    always_checks: &HashMap<DefId, bool>,
+    return_taint_params: &HashMap<DefId, HashSet<usize>>,
+    entry_checked: bool,
+) -> Vec<AccessControlFinding> {
+    let sinks = find_sensitive_sinks(tcx, body, inventory);
+
+    if sinks.is_empty() {
+        return Vec::new();
+    }
+
+    let callee_at = callee_locations(call_sites);
+    let sources = find_taint_sources(tcx, body, &sinks, &callee_at, return_taint_params);
+
+    let ok_points = ok_return_points(tcx, body);
+    let ok_blocks: HashSet<BasicBlock> = ok_points.iter().map(|l| l.block).collect();
+
+    let check_locations =
+        gating_check_locations(tcx, body, comparisons, call_sites, always_checks, &ok_blocks);
+    let entry = if entry_checked {
+        AuthState::Checked
+    } else {
+        AuthState::Unchecked
+    };
+
+    let (gating, _always) = solve_auth_gating(tcx, body, check_locations, entry, &ok_points);
+
+    sinks
+        .into_iter()
+        .map(|sink| {
+            let taint = sources.iter().find(|s| s.sink_location == sink.location).cloned();
+            let gated = gating.get(&sink.location.block).map(|s| *s == AuthState::Checked).unwrap_or(false);
+            AccessControlFinding {sink, taint, gated}
+        })
+        .collect()
+
+
+
+}
+
+fn find_sensitive_sinks<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    inventory: &StorageInventory,
+) -> Vec<SensitiveSink> {
+    let auth_names: HashSet<&str> = inventory
+        .items
+        .iter()
+        .filter(|i| i.is_auth)
+        .map(|i| i.name.as_str())
+        .collect();
+
+    if auth_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sinks = Vec::new();
+
+    for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
+        if let TerminatorKind::Call { func, args, .. } = &bb_data.terminator().kind {
+            let is_write =
+                callee_def_id(tcx, body, func).map_or(false, |d| is_storage_write_fn(tcx, d));
+            if !is_write {
+                continue;
+            }
+
+            // args[0] is `self` — the storage item on which save() is called
+            let storage_item_local = match args.get(0).and_then(|a| operand_local(&a.node)) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            let (symbolic_name, _) = find_storage_static_name(tcx, body, storage_item_local);
+
+            if auth_names.contains(symbolic_name.as_str()) {
+                sinks.push(SensitiveSink {
+                    location: Location {
+                        block: bb_idx,
+                        statement_index: bb_data.statements.len(),
+                    },
+                    storage_item_local,
+                    symbolic_name,
+                });
+            }
+        }
+    }
+
+    sinks
+}
+
+/// For each sink in `sinks`, reports a `TaintSource` when the written
+/// value belongs to the forward taint fixpoint.
+pub fn find_taint_sources<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    sinks: &[SensitiveSink],
+    callee_at: &HashMap<Location, DefId>,
+    return_taint_params: &HashMap<DefId, HashSet<usize>>,
+) -> Vec<TaintSource> {
+    if sinks.is_empty() {
+        return Vec::new();
+    }
+
+    let seed = address_seed(tcx, body);
+    let (tainted, origin) = propagate_taint_forward(body, &seed, callee_at, return_taint_params);
+    let mut sources = Vec::new();
+
+    for sink in sinks {
+        let bb_data = &body.basic_blocks[sink.location.block];
+
+        // The value being written is always the last argument of the `save()` call:
+        //   Item::save(self, store, data)         → data
+        //   Map::save(self, store, key, data)     → data
+        let value_local = match &bb_data.terminator().kind {
+            TerminatorKind::Call { args, .. } => {
+                match args.last().and_then(|a| operand_local(&a.node)) {
+                    Some(l) => l,
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+
+        if tainted.contains(&value_local) {
+            let param_local = origin.get(&value_local).copied().unwrap_or(value_local);
+            let param_ty = {
+                let ty = body.local_decls[param_local].ty;
+                let base_ty = match ty.kind() {
+                    TyKind::Ref(_, inner, _) => *inner,
+                    _ => ty,
+                };
+                normalize_ty_str(&format!("{:?}", base_ty))
+            };
+
+            sources.push(TaintSource {
+                param_local,
+                param_ty,
+                sink_location: sink.location,
+            });
+        }
+    }
+
+    sources
+}
+
+fn address_seed<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
+    let mut seed = HashSet::new();
+
+    for idx in 1..=body.arg_count {
+        let local = Local::from_usize((idx));
+        if address_parameter_ty(tcx, body, local).is_some() {
+            seed.insert(local);
+        }
+    }
+
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in data.statements.iter() {
+            let StatementKind::Assign(assign) = &stmt.kind else {
+                continue;
+            };
+            let (lhs, rvalue) = assign.as_ref();
+
+            let src_place = match rvalue {
+                Rvalue::Use(Operand::Copy(p), _) | Rvalue::Use(Operand::Move(p), _) => p,
+                Rvalue::Ref(_, _, p) => p,
+                _ => continue,
+            };
+
+            let root = src_place.local;
+            let is_param = root.as_usize() >= 1 && root.as_usize() <= body.arg_count;
+            if !is_param || src_place.projection.is_empty() {
+                continue;
+            }
+
+            // framework parameters are not considered attacker-controlled sources
+            if (is_framework_param(tcx, body, root)) {
+                continue;
+            }
+
+            if ty_mentions_address(tcx, src_place.ty(&body.local_decls, tcx).ty) {
+                seed.insert(lhs.local);
+            }
+        }
+    }
+
+    seed
+}
+
+/// Returns the normalized (dereferenced) type of `local` if it is a
+/// function parameter whose type is or contains an address type
+/// (`Addr`/`String`) — e.g. `Addr`, `String`, `Vec<Addr>`,
+/// `Vec<String>`. Such parameters are the taint sources.
+fn address_parameter_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    local: Local,
+) -> Option<String> {
+    let idx = local.as_usize();
+    if idx < 1 || idx > body.arg_count {
+        return None;
+    }
+
+    let ty = body.local_decls[local].ty;
+    if !ty_mentions_address(tcx, ty) {
+        return None;
+    }
+
+    let base_ty = match ty.kind() {
+        TyKind::Ref(_, inner, _) => *inner,
+        _ => ty,
+    };
+
+    Some(normalize_ty_str(&format!("{:?}", base_ty)))
+}
+
+/// Returns whether `ty` is, contains, or references an address type
+/// (`cosmwasm_std::Addr` or `String`).
+pub fn ty_mentions_address<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        TyKind::Ref(_, inner, _) => ty_mentions_address(tcx, *inner),
+        TyKind::Slice(inner) | TyKind::Array(inner, _) => ty_mentions_address(tcx, *inner),
+        TyKind::Tuple(tys) => tys.iter().any(|t| ty_mentions_address(tcx, t)),
+        TyKind::Adt(adt_def, args) => {
+            let did = adt_def.did();
+            if tcx.is_diagnostic_item(sym::String, did) || is_cosmwasm_addr(tcx, did) {
+                return true;
+            }
+            args.types().any(|t| ty_mentions_address(tcx, t))
+        }
+        _ => false,
+    }
 }

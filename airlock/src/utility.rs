@@ -173,3 +173,8 @@ pub fn is_message_info_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         if crate_name_is(tcx, adt_def.did(), "cosmwasm_std")
             && item_name_is(tcx, adt_def.did(), "MessageInfo"))
 }
+
+pub fn is_cosmwasm_addr(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    crate_name_is(tcx, def_id, "cosmwasm_std")
+        && matches!(tcx.item_name(def_id).as_str(), "Addr" | "CanonicalAddr")
+}
