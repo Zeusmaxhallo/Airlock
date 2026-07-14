@@ -1453,7 +1453,8 @@ pub fn compute_return_taint_params<'tcx>(
                 }
                 let mut seed = HashSet::new();
                 seed.insert(Local::from_usize(i + 1));
-                let (tainted, _origin) = propagate_taint_forward(body, &seed, &callee_at, &summary);
+                let (tainted, _origin) =
+                    propagate_taint_forward(tcx, body, &seed, &callee_at, &summary);
 
                 if ret_locals.iter().any(|rl| tainted.contains(rl)) {
                     flow.insert(i);
@@ -1544,6 +1545,7 @@ fn is_framework_param<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, local: Local) 
 }
 
 fn propagate_taint_forward<'tcx>(
+    tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     seed: &HashSet<Local>,
     callee_at: &HashMap<Location, DefId>,
@@ -1561,6 +1563,61 @@ fn propagate_taint_forward<'tcx>(
     }
 
     let (borrow_of, mut_borrow) = build_borrow_maps(body);
+
+    // Lücke 3 — storage-location-aware taint. A value read from storage is
+    // attacker-controlled only if that *same* storage item was written with
+    // tainted data earlier in this handler, never merely because the `deps`
+    // handle picked up taint from an unrelated call (e.g. an IBC transfer
+    // whose recipient is a user-supplied string, which spuriously tainted
+    // `deps` via the mut-borrow write-back). We track tainted items by DefId
+    // and decouple load/save from the conservative storage-handle taint.
+    //
+    // `item_def_of` pre-resolves the storage-item DefId of every load/save
+    // receiver once — `find_storage_static_name` scans all local consts and
+    // is far too costly to call inside the fixpoint.
+    let mut storage_receivers: Vec<Local> = Vec::new();
+    for (_, bb_data) in body.basic_blocks.iter_enumerated() {
+        if let TerminatorKind::Call { func, args, .. } = &bb_data.terminator().kind {
+            let is_store = callee_def_id(tcx, body, func)
+                .map_or(false, |d| is_storage_write_fn(tcx, d) || is_storage_load_fn(tcx, d));
+            if is_store {
+                if let Some(item_local) = args.get(0).and_then(|a| operand_local(&a.node)) {
+                    storage_receivers.push(item_local);
+                }
+            }
+        }
+    }
+    let mut item_def_of: HashMap<Local, Option<DefId>> = HashMap::new();
+    if !storage_receivers.is_empty() {
+        // One-pass type index over local storage consts (matches
+        // `find_storage_static_name`'s erased-type identity, first const of a
+        // type wins), then resolve each receiver by lookup.
+        let mut const_by_ty: HashMap<Ty<'tcx>, DefId> = HashMap::new();
+        for local_def_id in tcx.iter_local_def_id() {
+            if matches!(tcx.def_kind(local_def_id), DefKind::Const { .. }) {
+                let def_id = local_def_id.to_def_id();
+                let cty = tcx.erase_and_anonymize_regions(tcx.type_of(def_id).skip_binder());
+                const_by_ty.entry(cty).or_insert(def_id);
+            }
+        }
+        for item_local in storage_receivers {
+            item_def_of.entry(item_local).or_insert_with(|| {
+                let mut base = body.local_decls[item_local].ty;
+                while let TyKind::Ref(_, inner, _) = base.kind() {
+                    base = *inner;
+                }
+                const_by_ty
+                    .get(&tcx.erase_and_anonymize_regions(base))
+                    .copied()
+            });
+        }
+    }
+    // Items written with tainted data (DefId -> origin param). `unknown_item`
+    // is the conservative fallback when a written item cannot be resolved to a
+    // DefId: a later load is then still tainted (errs towards a false positive,
+    // never a false negative).
+    let mut tainted_items: HashMap<DefId, Local> = HashMap::new();
+    let mut unknown_item: Option<Local> = None;
 
     let mark = |local: Local,
                 src: Local,
@@ -1590,7 +1647,10 @@ fn propagate_taint_forward<'tcx>(
             }
 
             if let TerminatorKind::Call {
-                args, destination, ..
+                func,
+                args,
+                destination,
+                ..
             } = &bb_data.terminator().kind
             {
                 let location = Location {
@@ -1619,26 +1679,75 @@ fn propagate_taint_forward<'tcx>(
 
                 let first_src = arg_taint.iter().copied().flatten().next();
 
-                let dest_src = match callee_at
-                    .get(&location)
-                    .and_then(|callee| return_taint_params.get(callee))
-                {
-                    Some(flow) => arg_taint
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, s)| if flow.contains(&i) { *s } else { None }),
-                    None => first_src,
-                };
+                let callee = callee_def_id(tcx, body, func);
+                let is_store_write = callee.map_or(false, |d| is_storage_write_fn(tcx, d));
+                let is_store_load = callee.map_or(false, |d| is_storage_load_fn(tcx, d));
 
-                if let Some(src) = dest_src {
-                    changed |= mark(destination.local, src, &mut tainted, &mut origin);
-                }
+                if is_store_write {
+                    // A storage write persists its *data* argument (the last
+                    // one) into the item (`args[0]`). If that data is tainted,
+                    // remember the item as tainted — but do NOT taint the
+                    // storage handle, so unrelated later loads stay clean.
+                    let data_src = args
+                        .last()
+                        .and_then(|a| operand_local(&a.node))
+                        .filter(|l| tainted.contains(l))
+                        .and_then(|l| origin.get(&l).copied().or(Some(l)));
+                    if let Some(src) = data_src {
+                        match args
+                            .get(0)
+                            .and_then(|a| operand_local(&a.node))
+                            .and_then(|l| item_def_of.get(&l).copied().flatten())
+                        {
+                            Some(def_id) => {
+                                if !tainted_items.contains_key(&def_id) {
+                                    tainted_items.insert(def_id, src);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if unknown_item.is_none() {
+                                    unknown_item = Some(src);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                } else if is_store_load {
+                    // A loaded value is tainted only if this item (or an
+                    // unresolved written item) holds attacker data. It never
+                    // inherits taint from the storage-handle argument.
+                    let load_src = args
+                        .get(0)
+                        .and_then(|a| operand_local(&a.node))
+                        .and_then(|l| item_def_of.get(&l).copied().flatten())
+                        .and_then(|def_id| tainted_items.get(&def_id).copied())
+                        .or(unknown_item);
+                    if let Some(src) = load_src {
+                        changed |= mark(destination.local, src, &mut tainted, &mut origin);
+                    }
+                } else {
+                    let dest_src = match callee_at
+                        .get(&location)
+                        .and_then(|callee| return_taint_params.get(callee))
+                    {
+                        Some(flow) => arg_taint
+                            .iter()
+                            .enumerate()
+                            .find_map(|(i, s)| if flow.contains(&i) { *s } else { None }),
+                        None => first_src,
+                    };
 
-                if let Some(src) = first_src {
-                    for l in arg_locals.iter() {
-                        if mut_borrow.contains(l) {
-                            if let Some(base) = borrow_of.get(l).copied() {
-                                changed |= mark(base, src, &mut tainted, &mut origin);
+                    if let Some(src) = dest_src {
+                        changed |= mark(destination.local, src, &mut tainted, &mut origin);
+                    }
+
+                    if let Some(src) = first_src {
+                        for l in arg_locals.iter() {
+                            if mut_borrow.contains(l) {
+                                if let Some(base) = borrow_of.get(l).copied() {
+                                    changed |= mark(base, src, &mut tainted, &mut origin);
+                                }
                             }
                         }
                     }
@@ -1968,7 +2077,8 @@ pub fn find_taint_sources<'tcx>(
     }
 
     let seed = address_seed(tcx, body);
-    let (tainted, origin) = propagate_taint_forward(body, &seed, callee_at, return_taint_params);
+    let (tainted, origin) =
+        propagate_taint_forward(tcx, body, &seed, callee_at, return_taint_params);
     let mut sources = Vec::new();
 
     for sink in sinks {
@@ -1997,6 +2107,21 @@ pub fn find_taint_sources<'tcx>(
                 };
                 normalize_ty_str(&format!("{:?}", base_ty))
             };
+
+            // Diagnostic (opt-in): also trace TAINTED sinks so an
+            // over-approximated flow behind a false-positive VULN can be
+            // located hop by hop (which call/borrow first taints the value).
+            if std::env::var("AIRLOCK_DEBUG_TAINT").is_ok() {
+                eprintln!(
+                    "\t[dbg] TAINTED sink {} @ {:?}: value=_{}  origin=_{} : {}",
+                    sink.symbolic_name,
+                    sink.location,
+                    value_local.as_usize(),
+                    param_local.as_usize(),
+                    param_ty
+                );
+                debug_trace_sink(body, &tainted, value_local);
+            }
 
             sources.push(TaintSource {
                 param_local,
