@@ -3,7 +3,8 @@ use crate::{
     storage_inventory::AuthStateVariable,
     utility::{
         self, callee_def_id, is_cosmwasm_addr, is_forwarding_glue_fn, is_framework_ty,
-        is_result_def, is_result_ty, is_storage_load_fn, is_storage_write_fn, normalize_ty_str,
+        is_result_def, is_result_ty, is_std_string, is_storage_load_fn, is_storage_write_fn,
+        normalize_ty_str,
     },
 };
 use rustc_hir::{
@@ -1174,19 +1175,48 @@ fn authorized_gate_locations<'tcx>(
     }
 
     let predecessors = body.basic_blocks.predecessors();
-    let candidates: HashSet<BasicBlock> = authorized_edges.iter().map(|&(_, t)| t).collect();
+
+    // Forward must-analysis over blocks: `authorized[B]` holds iff *every* path
+    // from the entry to `B` crosses an authorizing comparison edge. Marking the
+    // immediate successor of each edge is not enough — an `Option` comparison
+    // (`Some(sender) != cfg.owner`) leaves a temporary that drop-elaboration
+    // frees on the taken edge, inserting a drop/goto block between the switch
+    // and the real convergence block. Propagating the property through such
+    // forwarding blocks recovers those gates. Sound: a block is marked only when
+    // no unauthorized path can reach it, so no vulnerability is ever hidden.
+    let entry = BasicBlock::from_usize(0);
+    let mut authorized: HashMap<BasicBlock, bool> = HashMap::new();
+    for (bb, _) in body.basic_blocks.iter_enumerated() {
+        // Greatest fixpoint: optimistic `true` everywhere but the entry, then
+        // monotonically lowered as unauthorized paths are discovered.
+        authorized.insert(bb, bb != entry);
+    }
+    loop {
+        let mut changed = false;
+        for (bb, _) in body.basic_blocks.iter_enumerated() {
+            if bb == entry {
+                continue;
+            }
+            let preds = &predecessors[bb];
+            let new_val = !preds.is_empty()
+                && preds.iter().all(|&p| {
+                    authorized_edges.contains(&(p, bb)) || authorized[&p]
+                });
+            if new_val != authorized[&bb] {
+                authorized.insert(bb, new_val);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
     let mut result = HashSet::new();
-    for t in candidates {
-        let preds = &predecessors[t];
-        if preds.is_empty() {
-            continue;
-        }
-        // Sound only if *every* way into `t` is an authorizing edge.
-        let all_authorized = preds.iter().all(|&p| authorized_edges.contains(&(p, t)));
-        if all_authorized {
+    for (bb, _) in body.basic_blocks.iter_enumerated() {
+        if bb != entry && authorized[&bb] {
             result.insert(Location {
-                block: t,
+                block: bb,
                 statement_index: 0,
             });
         }
@@ -1973,10 +2003,95 @@ pub fn find_taint_sources<'tcx>(
                 param_ty,
                 sink_location: sink.location,
             });
+        } else if std::env::var("AIRLOCK_DEBUG_TAINT").is_ok() {
+            // Diagnostic (opt-in): a sink whose written value is NOT tainted
+            // even though address-typed parameters were seeded. Backward-trace
+            // the value to the exact hop where taint is lost (recall gaps).
+            let seed_str: Vec<String> =
+                seed.iter().map(|l| format!("_{}", l.as_usize())).collect();
+            eprintln!(
+                "\t[dbg] UNTAINTED sink {} @ {:?}: value=_{}  seed=[{}]",
+                sink.symbolic_name,
+                sink.location,
+                value_local.as_usize(),
+                seed_str.join(",")
+            );
+            debug_trace_sink(body, &tainted, value_local);
         }
     }
 
     sources
+}
+
+/// Diagnostic helper (opt-in via `AIRLOCK_DEBUG_TAINT`): backward-traces the
+/// definitions of `value_local` and prints, per hop, whether each local is
+/// tainted (`T`) — pinpointing the statement where a taint chain breaks. A
+/// `*` marks a tainted read operand. Purely observational; no analysis state
+/// is mutated.
+fn debug_trace_sink<'tcx>(body: &Body<'tcx>, tainted: &HashSet<Local>, value_local: Local) {
+    // Index every local to the rvalues / call terminators that define it.
+    let mut defs: HashMap<Local, Vec<(String, Vec<Local>)>> = HashMap::new();
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in data.statements.iter() {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (lhs, rvalue) = assign.as_ref();
+                defs.entry(lhs.local)
+                    .or_default()
+                    .push((format!("{:?}", rvalue), rvalue_locals(rvalue)));
+            }
+        }
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &data.terminator().kind
+        {
+            let reads: Vec<Local> = args.iter().filter_map(|a| operand_local(&a.node)).collect();
+            defs.entry(destination.local)
+                .or_default()
+                .push((format!("call {:?}", func), reads));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut stack = vec![(value_local, 0usize)];
+    while let Some((local, depth)) = stack.pop() {
+        if depth > 14 || !seen.insert(local) {
+            continue;
+        }
+        let flag = if tainted.contains(&local) { 'T' } else { ' ' };
+        let indent = "  ".repeat(depth);
+        match defs.get(&local) {
+            Some(deflist) => {
+                for (desc, reads) in deflist {
+                    let reads_str: Vec<String> = reads
+                        .iter()
+                        .map(|r| format!("_{}{}", r.as_usize(), if tainted.contains(r) { "*" } else { "" }))
+                        .collect();
+                    eprintln!(
+                        "\t[dbg{}] {}_{} <- {}  reads=[{}]",
+                        flag,
+                        indent,
+                        local.as_usize(),
+                        desc.chars().take(72).collect::<String>(),
+                        reads_str.join(",")
+                    );
+                    for &r in reads {
+                        stack.push((r, depth + 1));
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "\t[dbg{}] {}_{} (parameter or undefined)",
+                    flag,
+                    indent,
+                    local.as_usize()
+                );
+            }
+        }
+    }
 }
 
 fn address_seed<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
@@ -2053,12 +2168,23 @@ fn address_parameter_ty<'tcx>(
 /// (`cosmwasm_std::Addr` or `String`).
 pub fn ty_mentions_address<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     match ty.kind() {
+        // Bare `str` (behind a `&str` reference) is address-bearing text.
+        TyKind::Str => true,
         TyKind::Ref(_, inner, _) => ty_mentions_address(tcx, *inner),
         TyKind::Slice(inner) | TyKind::Array(inner, _) => ty_mentions_address(tcx, *inner),
         TyKind::Tuple(tys) => tys.iter().any(|t| ty_mentions_address(tcx, t)),
         TyKind::Adt(adt_def, args) => {
             let did = adt_def.did();
-            if tcx.is_diagnostic_item(sym::String, did) || is_cosmwasm_addr(tcx, did) {
+            // `String` recognition (Lücke 2): the `rustc_diagnostic_item`
+            // lookup for `String` fails on the pinned toolchain, so
+            // `String`/`Option<String>` message fields carrying owner/admin
+            // addresses were never seeded and their writes went untainted.
+            // Match by crate+name first, keeping the diagnostic item as a
+            // fallback.
+            if is_std_string(tcx, did)
+                || tcx.is_diagnostic_item(sym::String, did)
+                || is_cosmwasm_addr(tcx, did)
+            {
                 return true;
             }
             args.types().any(|t| ty_mentions_address(tcx, t))

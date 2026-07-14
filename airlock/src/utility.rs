@@ -178,3 +178,15 @@ pub fn is_cosmwasm_addr(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     crate_name_is(tcx, def_id, "cosmwasm_std")
         && matches!(tcx.item_name(def_id).as_str(), "Addr" | "CanonicalAddr")
 }
+
+/// Returns `true` if `def_id` identifies the standard-library owned string
+/// type (`alloc::string::String`, re-exported as `std::string::String`).
+///
+/// The `rustc_diagnostic_item` lookup for `String` proved unreliable on the
+/// pinned toolchain — `String`/`Option<String>` message parameters were never
+/// recognised as taint sources — so this matches by crate + item name, exactly
+/// like [`is_cosmwasm_addr`].
+pub fn is_std_string(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    item_name_is(tcx, def_id, "String")
+        && (crate_name_is(tcx, def_id, "alloc") || crate_name_is(tcx, def_id, "std"))
+}
