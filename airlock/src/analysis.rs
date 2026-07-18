@@ -2539,6 +2539,21 @@ fn address_seed<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
                 continue;
             }
 
+            // A `&mut T` parameter is an in-out buffer for internal state — a
+            // struct the caller loaded from storage and threads in for mutation
+            // (e.g. `cfg: &mut Config`), never attacker input. CosmWasm message
+            // data always arrives as owned leaf params, never behind `&mut`.
+            // Reading an address *field* out of such a struct must not seed
+            // attacker taint. False positive it removes: astroport maker
+            // `distribute(cfg: &mut Config)` reads `cfg.astro_token_contract`
+            // and later `CONFIG.save(cfg)` — a numeric-only update that was
+            // flagged VULN because the field read tainted the whole struct.
+            if let TyKind::Ref(_, _, mutbl) = body.local_decls[root].ty.kind() {
+                if mutbl.is_mut() {
+                    continue;
+                }
+            }
+
             if ty_mentions_address(tcx, src_place.ty(&body.local_decls, tcx).ty) {
                 seed.insert(lhs.local);
             }
