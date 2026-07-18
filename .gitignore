@@ -28,6 +28,12 @@ corpus/
 corpus-results/
 CORPUS_REPORT.md
 
+# weitere Tests
+eval/
+recall-testset/
+GROUND_TRUTH_EVAL.md
+LIMITATIONS.md
+
 # Ad-hoc-Testartefakte
 test_direct.exe
 test-contract/

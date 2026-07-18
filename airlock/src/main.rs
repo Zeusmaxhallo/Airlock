@@ -143,6 +143,20 @@ fn run_analysis(args: &Vec<String>) {
 
             let always_checks = analysis::compute_always_checks(tcx, &call_graph, &fn_comparisons);
 
+            // Closures/functions whose boolean return is an `info.sender`
+            // comparison. Lets the gating recognise `Option`-predicate auth
+            // guards (`owner.map_or(true, |o| o != info.sender)`) whose check
+            // hides inside a combinator closure. Computed once over the stable
+            // per-function comparison summary.
+            let sender_predicate = analysis::sender_predicate_summary(tcx, &fn_comparisons);
+
+            // Closures that always check info.sender before every Ok-return.
+            // Recognises the `Item::update(store, |s| { if sender != s.owner {..};
+            // Ok(s) })` idiom, where the guard and the write both live inside the
+            // update closure (Variante B).
+            let closure_ac =
+                analysis::closures_always_checking(tcx, &fn_comparisons, &always_checks);
+
             // Sorted for deterministic output despite HashMap iteration order.
             let mut checking: Vec<String> = always_checks
                 .iter()
@@ -231,7 +245,15 @@ fn run_analysis(args: &Vec<String>) {
                     continue;
                 }
                 let body = tcx.optimized_mir(*node);
-                let comparisons = fn_comparisons.get(node).cloned().unwrap_or_default();
+                let mut comparisons = fn_comparisons.get(node).cloned().unwrap_or_default();
+                // Augment with synthetic comparisons for `Option`-predicate auth
+                // gates in this body (map_or / is_some_and / is_none_or over a
+                // sender-predicate closure). Additive: only reduces false positives.
+                comparisons.extend(analysis::option_predicate_comparisons(
+                    tcx,
+                    body,
+                    &sender_predicate,
+                ));
                 let sites = sites_by_caller.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
                 let findings = analysis::analyze_access_control(
                     tcx,
@@ -242,6 +264,7 @@ fn run_analysis(args: &Vec<String>) {
                     &always_checks,
                     &return_taint_params,
                     entry_checked.get(node).copied().unwrap_or(false),
+                    &closure_ac,
                 );
                 let fname = tcx.def_path_str(*node);
                 for f in findings {

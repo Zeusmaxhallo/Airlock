@@ -1239,6 +1239,196 @@ fn comparison_result_local<'tcx>(body: &Body<'tcx>, cmp: &SenderComparison) -> O
     }
 }
 
+/// Identifies closures/functions whose boolean return value *is* an
+/// `info.sender` equality comparison, keyed by `DefId` to that comparison's
+/// operator. Consumed by [`option_predicate_comparisons`] to recognise
+/// `Option`-predicate authorization gates such as
+/// `config.owner.map_or(true, |o| o != info.sender)`, where the sender
+/// comparison lives inside the combinator's closure rather than in a direct
+/// `if info.sender != owner` guard.
+pub fn sender_predicate_summary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_comparisons: &HashMap<DefId, Vec<SenderComparison>>,
+) -> HashMap<DefId, BinOp> {
+    let mut out = HashMap::new();
+    for (&def_id, comps) in fn_comparisons {
+        if !def_id.is_local() || !tcx.is_mir_available(def_id) {
+            continue;
+        }
+        let body = tcx.optimized_mir(def_id);
+        for cmp in comps {
+            if !matches!(cmp.op, BinOp::Eq | BinOp::Ne) {
+                continue;
+            }
+            if let Some(res) = comparison_result_local(body, cmp) {
+                if comparison_reaches_return(body, res) {
+                    out.insert(def_id, cmp.op);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True if `local` is the return place `_0` or is directly moved/copied into it.
+/// One hop suffices for the single-expression predicate closures this targets
+/// (`|o| o != sender` lowers to `_0 = Ne(..)` or `_tmp = Ne(..); _0 = move _tmp`).
+fn comparison_reaches_return<'tcx>(body: &Body<'tcx>, local: Local) -> bool {
+    let ret = Local::from_usize(0);
+    if local == ret {
+        return true;
+    }
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in data.statements.iter() {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (place, rvalue) = assign.as_ref();
+                if place.local == ret && place.projection.is_empty() {
+                    if let Rvalue::Use(op, _) = rvalue {
+                        if operand_local(op) == Some(local) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Recognises `Option`/`bool`-predicate combinators whose closure argument is a
+/// sender predicate (per [`sender_predicate_summary`]) and synthesises a
+/// [`SenderComparison`] at the call. The synthetic comparison's *result* is the
+/// call's boolean destination, so the existing edge-sensitive gating
+/// ([`authorized_gate_locations`], [`effective_guard_locations`]) treats the
+/// `SwitchInt` on that boolean exactly like a direct `if info.sender != owner`
+/// guard — closing the false positive where the sender check hides inside a
+/// combinator closure (e.g. `config.owner.map_or(true, |o| o != info.sender)`).
+///
+/// Only the *sound* shapes are emitted: the value the combinator yields when the
+/// principal is absent (the `None` case) must equal the **non-authorising**
+/// outcome, so a missing owner can never silently authorise a write:
+///   * `x.map_or(true,  |o| o != sender)`  (None → true  → reject)   op = Ne
+///   * `x.is_none_or(   |o| o != sender)`  (None → true  → reject)   op = Ne
+///   * `x.map_or(false, |o| o == sender)`  (None → false → reject)   op = Eq
+///   * `x.is_some_and(  |o| o == sender)`  (None → false → reject)   op = Eq
+/// Any other default/operator pairing is skipped (no gate synthesised), keeping
+/// the change strictly false-positive-reducing and never vulnerability-hiding.
+pub fn option_predicate_comparisons<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    sender_predicate: &HashMap<DefId, BinOp>,
+) -> Vec<SenderComparison> {
+    let mut out = Vec::new();
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let Some(callee) = utility::callee_def_id(tcx, body, func) else {
+            continue;
+        };
+        let name = tcx.item_name(callee);
+        let name = name.as_str();
+        if !matches!(name, "map_or" | "is_some_and" | "is_none_or") {
+            continue;
+        }
+
+        // The closure argument, resolved to its sender-comparison operator.
+        let mut op: Option<BinOp> = None;
+        for a in args.iter() {
+            let ty = a.node.ty(&body.local_decls, tcx);
+            if let TyKind::Closure(cdef, _) = ty.kind() {
+                if let Some(o) = sender_predicate.get(cdef) {
+                    op = Some(*o);
+                }
+            }
+        }
+        let Some(op) = op else {
+            continue;
+        };
+
+        // Value the combinator produces when the principal is absent (`None`).
+        let none_value = match name {
+            "is_some_and" => false,
+            "is_none_or" => true,
+            // `map_or(default, f)`: the `bool`-typed argument. Read it even when
+            // `optimized_mir` materialised the literal into a temporary
+            // (`_x = const true; map_or(_, move _x, _)`).
+            _ => {
+                let mut d = None;
+                for a in args.iter() {
+                    let ty = a.node.ty(&body.local_decls, tcx);
+                    if !matches!(ty.kind(), TyKind::Bool) {
+                        continue;
+                    }
+                    d = const_bool_operand(body, &a.node);
+                }
+                match d {
+                    Some(b) => b,
+                    None => continue,
+                }
+            }
+        };
+
+        // Soundness: `None` must yield the non-authorising outcome.
+        //   op == Ne -> authorising edge is the `false` result -> None must be `true`.
+        //   op == Eq -> authorising edge is the `true`  result -> None must be `false`.
+        let sound = match op {
+            BinOp::Ne => none_value,
+            BinOp::Eq => !none_value,
+            _ => false,
+        };
+        if !sound {
+            continue;
+        }
+
+        out.push(SenderComparison {
+            location: Location {
+                block: bb,
+                statement_index: data.statements.len(),
+            },
+            // Nominal locals — the gating keys off the operator and the
+            // comparison *result* (the call destination), not these.
+            sender_local: destination.local,
+            compared_local: destination.local,
+            op,
+            description: format!("Option::{} sender-predicate gate", name),
+        });
+    }
+    out
+}
+
+/// Reads a constant `bool` from an operand, tracing one hop through a
+/// `_x = const <bool>` assignment when the literal was materialised into a
+/// temporary (as `optimized_mir` frequently does for call arguments).
+fn const_bool_operand<'tcx>(body: &Body<'tcx>, op: &Operand<'tcx>) -> Option<bool> {
+    if let Some(c) = op.constant() {
+        return c.const_.try_to_bool();
+    }
+    let local = operand_local(op)?;
+    for (_, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in data.statements.iter() {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (place, rvalue) = assign.as_ref();
+                if place.local == local && place.projection.is_empty() {
+                    if let Rvalue::Use(inner, _) = rvalue {
+                        if let Some(c) = inner.constant() {
+                            return c.const_.try_to_bool();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Forward-reachable basic blocks from `start` (inclusive).
 fn reachable_from<'tcx>(body: &Body<'tcx>, start: BasicBlock) -> HashSet<BasicBlock> {
     let mut seen = HashSet::new();
@@ -1977,6 +2167,7 @@ pub fn analyze_access_control<'tcx>(
     always_checks: &HashMap<DefId, bool>,
     return_taint_params: &HashMap<DefId, HashSet<usize>>,
     entry_checked: bool,
+    closure_ac: &HashSet<DefId>,
 ) -> Vec<AccessControlFinding> {
     let sinks = find_sensitive_sinks(tcx, body, inventory);
 
@@ -2004,13 +2195,108 @@ pub fn analyze_access_control<'tcx>(
         .into_iter()
         .map(|sink| {
             let taint = sources.iter().find(|s| s.sink_location == sink.location).cloned();
-            let gated = gating.get(&sink.location.block).map(|s| *s == AuthState::Checked).unwrap_or(false);
+            // Gated by a parent-body sender check, OR — for the
+            // `Item::update(store, |s| { if sender != s.owner {..}; Ok(s) })`
+            // idiom — by an always-checking sender guard inside the closure
+            // argument of the write call itself (Variante B).
+            let gated = gating.get(&sink.location.block).map(|s| *s == AuthState::Checked).unwrap_or(false)
+                || sink_gated_by_closure(tcx, body, sink.location, closure_ac);
             AccessControlFinding {sink, taint, gated}
         })
         .collect()
+}
 
+/// Closures whose body crosses a `info.sender` check on *every* path to an
+/// `Ok`-return. Recognises the `Item::update` / `Map::update` authorization
+/// idiom where both the guard and the write live inside the update closure:
+///   `STATE.update(store, |mut s| { if info.sender != s.owner { return Err(..) };
+///                                  s.field = ..; Ok(s) })`
+/// The update call is a storage-write sink in the *parent*, but its guard is in
+/// the closure — so the parent-body gating alone reports a false positive. This
+/// reuses the Stage-3 always-check dataflow on each closure body.
+pub fn closures_always_checking<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_comparisons: &HashMap<DefId, Vec<SenderComparison>>,
+    always_checks: &HashMap<DefId, bool>,
+) -> HashSet<DefId> {
+    let dbg = std::env::var("AIRLOCK_DEBUG_CLOSURE").is_ok();
+    let mut out = HashSet::new();
+    for (&def_id, comps) in fn_comparisons {
+        if !matches!(tcx.def_kind(def_id), DefKind::Closure) {
+            continue;
+        }
+        if !def_id.is_local() || !tcx.is_mir_available(def_id) || comps.is_empty() {
+            continue;
+        }
+        let body = tcx.optimized_mir(def_id);
+        let ok_points = ok_return_points(tcx, body);
+        if ok_points.is_empty() {
+            // Only Result-returning closures (update actions) qualify; a
+            // bool-returning predicate closure (map_or/is_some_and) has no
+            // `Ok(..)` and is handled by `option_predicate_comparisons`.
+            if dbg {
+                eprintln!(
+                    "[closure-ac] SKIP {} — comps={} ok_points=0",
+                    tcx.def_path_str(def_id),
+                    comps.len()
+                );
+            }
+            continue;
+        }
+        let ok_blocks: HashSet<BasicBlock> = ok_points.iter().map(|l| l.block).collect();
+        let checks = gating_check_locations(tcx, body, comps, &[], always_checks, &ok_blocks);
+        let n_checks = checks.len();
+        let (_in, always) = solve_auth_gating(tcx, body, checks, AuthState::Unchecked, &ok_points);
+        if dbg {
+            eprintln!(
+                "[closure-ac] {} — comps={} ok_points={} checks={} always={:?}",
+                tcx.def_path_str(def_id),
+                comps.len(),
+                ok_points.len(),
+                n_checks,
+                always
+            );
+        }
+        if always == AuthState::Checked {
+            out.insert(def_id);
+        }
+    }
+    out
+}
 
-
+/// True if the write call at `sink_loc` passes a closure argument that is an
+/// always-checking sender guard (see [`closures_always_checking`]).
+fn sink_gated_by_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    sink_loc: Location,
+    closure_ac: &HashSet<DefId>,
+) -> bool {
+    if closure_ac.is_empty() {
+        return false;
+    }
+    let TerminatorKind::Call { args, .. } = &body.basic_blocks[sink_loc.block].terminator().kind
+    else {
+        return false;
+    };
+    let dbg = std::env::var("AIRLOCK_DEBUG_CLOSURE").is_ok();
+    for a in args.iter() {
+        let ty = a.node.ty(&body.local_decls, tcx);
+        if let TyKind::Closure(cdef, _) = ty.kind() {
+            if dbg {
+                eprintln!(
+                    "[closure-ac] sink @ {:?} closure-arg {} in_ac={}",
+                    sink_loc,
+                    tcx.def_path_str(*cdef),
+                    closure_ac.contains(cdef)
+                );
+            }
+            if closure_ac.contains(cdef) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn find_sensitive_sinks<'tcx>(
