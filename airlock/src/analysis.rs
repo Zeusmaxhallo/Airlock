@@ -386,10 +386,34 @@ fn check_iter_search_call(
 /// as MIR, so the *call* — with `info.sender` as an argument — is what we
 /// treat as the check.
 fn is_auth_sink(name: &str) -> bool {
-    matches!(
+    // Established library helpers (cw-ownable / cw-controllers).
+    if matches!(
         name,
         "assert_admin" | "assert_owner" | "assert_only_owner" | "update_ownership" | "is_admin"
-    )
+    ) {
+        return true;
+    }
+
+    // Project-specific authorization helpers living in a *sibling workspace
+    // crate*. Those are cross-crate calls, so their MIR — and with it the
+    // sender comparison — is unavailable; only the call itself is observable.
+    // Recognised by naming convention: an asserting verb combined with an
+    // authorization noun (e.g. komple's `check_admin_privileges`,
+    // `ensure_owner`, `only_operator`, `verify_permissions`).
+    //
+    // Deliberately narrow to avoid masking a real vulnerability:
+    // * `validate_*` is excluded — in CosmWasm it overwhelmingly means
+    //   *format* validation (`addr_validate`), not authorization.
+    // * reading verbs (`get_`/`load_`/`query_`) are not asserting verbs.
+    // Two further conditions are enforced by the caller and keep this sound:
+    // the call must receive `info.sender` as an argument, and its result must
+    // feed a branch that aborts the Ok-path (`?`), see
+    // [`effective_guard_locations`] — an ignored `Result` never gates.
+    const VERBS: [&str; 6] = ["assert_", "check_", "ensure_", "require_", "verify_", "only_"];
+    const NOUNS: [&str; 7] = [
+        "admin", "owner", "auth", "privilege", "permission", "operator", "minter",
+    ];
+    VERBS.iter().any(|v| name.starts_with(v)) && NOUNS.iter().any(|n| name.contains(n))
 }
 
 /// Records a call to a known authorization helper (see [`is_auth_sink`]) as a
@@ -465,13 +489,24 @@ pub fn compute_sender_locals<'tcx>(
                 ..
             } = &bb_data.terminator().kind
             {
-                let callee_name =
-                    utility::callee_def_id(tcx, body, func).map(|d| tcx.item_name(d).to_string());
-                if callee_name
-                    .as_deref()
-                    .map(is_identity_preserving)
-                    .unwrap_or(false)
-                {
+                let callee = utility::callee_def_id(tcx, body, func);
+                let identity = callee
+                    .map(|d| is_identity_preserving(tcx.item_name(d).as_str()))
+                    .unwrap_or(false);
+                // Forwarding glue (`?` via `Try::branch`/`from_residual`,
+                // `unwrap`, `ok_or`, `map_err`, …) hands its payload straight
+                // through. Without this the taint dies at the `?` of a
+                // fallible conversion, so a guard like
+                //     if deps.api.addr_canonicalize(info.sender.as_str())? != cfg.owner
+                // is never recognised as a sender comparison — the conversion
+                // itself is identity-preserving, but its `Result` is unwrapped
+                // by glue. The gating already resolves this glue chain
+                // (`build_comparison_alias_map`); the sender taint has to
+                // follow the same route.
+                let glue = callee
+                    .map(|d| is_forwarding_glue_fn(tcx, d))
+                    .unwrap_or(false);
+                if identity || glue {
                     let any_arg_tainted = args
                         .iter()
                         .filter_map(|a| operand_local(&a.node))
@@ -543,6 +578,22 @@ fn is_identity_preserving(name: &str) -> bool {
             | "deref"
             | "deref_mut"
             | "borrow"
+            // `cosmwasm_std::Api` address conversions return the *same identity*
+            // in a different representation (`&str` -> `Addr` -> `CanonicalAddr`),
+            // so the sender marking has to survive them. Without this the very
+            // common dispatcher idiom
+            //     if deps.api.addr_canonicalize(info.sender.as_str())? != config.owner
+            // is not recognised as a sender check at all, and every write it
+            // guards is reported as a false positive (found on White Whale's
+            // terraswap_factory in the wild corpus).
+            //
+            // Sound in both directions: identity preservation only forwards an
+            // *already* marked argument, so validating an attacker-supplied
+            // address (`addr_validate(&new_owner)`) still carries attacker taint
+            // rather than creating a bogus gate.
+            | "addr_validate"
+            | "addr_canonicalize"
+            | "addr_humanize"
     )
 }
 
