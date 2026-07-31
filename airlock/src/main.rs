@@ -149,6 +149,10 @@ fn run_analysis(args: &Vec<String>) {
             // hides inside a combinator closure. Computed once over the stable
             // per-function comparison summary.
             let sender_predicate = analysis::sender_predicate_summary(tcx, &fn_comparisons);
+            // Boolesche Auth-Helfer (`is_trusted`, `is_approved_or_owner`, ...).
+            // Lockereres Kriterium als sender_predicate_summary: solche Helfer
+            // verzweigen meist intern, statt den Vergleich zurueckzugeben.
+            let bool_predicates = analysis::bool_predicate_fns(tcx, &fn_comparisons);
 
             // Closures that always check info.sender before every Ok-return.
             // Recognises the `Item::update(store, |s| { if sender != s.owner {..};
@@ -253,6 +257,13 @@ fn run_analysis(args: &Vec<String>) {
                     tcx,
                     body,
                     &sender_predicate,
+                ));
+                // Direkte Aufrufe boolescher Auth-Helfer (`if !is_trusted(..)`,
+                // `require!(is_owner(..)?, ..)`).
+                comparisons.extend(analysis::predicate_call_comparisons(
+                    tcx,
+                    body,
+                    &bool_predicates,
                 ));
                 let sites = sites_by_caller.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
                 let findings = analysis::analyze_access_control(

@@ -409,7 +409,15 @@ fn is_auth_sink(name: &str) -> bool {
     // the call must receive `info.sender` as an argument, and its result must
     // feed a branch that aborts the Ok-path (`?`), see
     // [`effective_guard_locations`] — an ignored `Result` never gates.
-    const VERBS: [&str; 6] = ["assert_", "check_", "ensure_", "require_", "verify_", "only_"];
+    // `is_` deckt die verbreiteten Bool-Praedikate aus Dependency-Crates ab
+    // (`OWNER.is_owner(deps, &info.sender)?`, `is_owner_or_operator(..)`,
+    // `is_approved_or_owner(..)`). Deren MIR ist cross-crate nicht verfuegbar,
+    // die lokale Variante deckt `predicate_call_comparisons` ab. Auch hier gilt:
+    // ein ignoriertes Ergebnis gatet nie, weil `effective_guard_locations` einen
+    // den Ok-Pfad verlassenden Zweig verlangt.
+    const VERBS: [&str; 7] = [
+        "assert_", "check_", "ensure_", "require_", "verify_", "only_", "is_",
+    ];
     const NOUNS: [&str; 7] = [
         "admin", "owner", "auth", "privilege", "permission", "operator", "minter",
     ];
@@ -1322,9 +1330,10 @@ pub fn sender_predicate_summary<'tcx>(
     out
 }
 
-/// True if `local` is the return place `_0` or is directly moved/copied into it.
-/// One hop suffices for the single-expression predicate closures this targets
-/// (`|o| o != sender` lowers to `_0 = Ne(..)` or `_tmp = Ne(..); _0 = move _tmp`).
+/// True if `local` is the return place `_0` or flows into it in one hop —
+/// either directly (`_0 = move _tmp`) or wrapped in an aggregate, which covers
+/// the very common `fn is_owner(..) -> StdResult<bool>` shape where the
+/// comparison result is returned as `_0 = Ok(_tmp)`.
 fn comparison_reaches_return<'tcx>(body: &Body<'tcx>, local: Local) -> bool {
     let ret = Local::from_usize(0);
     if local == ret {
@@ -1334,17 +1343,143 @@ fn comparison_reaches_return<'tcx>(body: &Body<'tcx>, local: Local) -> bool {
         for stmt in data.statements.iter() {
             if let StatementKind::Assign(assign) = &stmt.kind {
                 let (place, rvalue) = assign.as_ref();
-                if place.local == ret && place.projection.is_empty() {
-                    if let Rvalue::Use(op, _) = rvalue {
+                if place.local != ret || !place.projection.is_empty() {
+                    continue;
+                }
+                match rvalue {
+                    Rvalue::Use(op, _) => {
                         if operand_local(op) == Some(local) {
                             return true;
                         }
                     }
+                    // `Ok(cmp)` / `Some(cmp)`: predicate helpers that return a
+                    // fallible bool (`-> StdResult<bool>`), called with `?`.
+                    Rvalue::Aggregate(_, operands) => {
+                        if operands.iter().any(|o| operand_local(o) == Some(local)) {
+                            return true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
     false
+}
+
+/// Local functions that return a boolean *and* compare `info.sender` somewhere
+/// in their body — the relaxed criterion behind [`predicate_call_comparisons`].
+///
+/// [`sender_predicate_summary`] requires the comparison result to *flow into*
+/// the return value, which only holds for single-expression predicates
+/// (`|o| o != sender`). Real auth helpers are usually branching:
+///
+/// ```ignore
+/// pub fn is_trusted(sender: &Addr, config: &Config) -> bool {   // Oak CTF-03
+///     let mut trusted = false;
+///     if sender == config.owner { trusted = true; }             // flag, not return
+///     ...
+///     trusted
+/// }
+/// fn is_approved_or_owner(deps: Deps, spender: &Addr, id: &str) -> StdResult<bool> {
+///     if owner == *spender { return Ok(true); }                 // early const return
+///     ...
+/// }
+/// ```
+///
+/// Requiring only "boolean return + contains a sender comparison" is looser, but
+/// the decisive restriction sits on the caller side: the result must feed a
+/// branch that abandons the Ok-path (`effective_guard_locations`). A boolean
+/// helper that inspects the sender and whose result triggers an early `Err` is
+/// an authorization check for all practical purposes; one whose result merely
+/// selects a fee stays ungated (covered by the `set_via_fee_branch` test case).
+pub fn bool_predicate_fns<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_comparisons: &HashMap<DefId, Vec<SenderComparison>>,
+) -> HashSet<DefId> {
+    let mut out = HashSet::new();
+    for (&def_id, comps) in fn_comparisons {
+        if comps.is_empty() || !def_id.is_local() || !tcx.is_mir_available(def_id) {
+            continue;
+        }
+        let body = tcx.optimized_mir(def_id);
+        let ret_ty = body.local_decls[Local::from_usize(0)].ty;
+        let boolish = match ret_ty.kind() {
+            TyKind::Bool => true,
+            // `Result<bool, E>` / `Option<bool>`: first type argument is the payload.
+            TyKind::Adt(_, args) => args
+                .types()
+                .next()
+                .map_or(false, |t| matches!(t.kind(), TyKind::Bool)),
+            _ => false,
+        };
+        if boolish {
+            out.insert(def_id);
+        }
+    }
+    out
+}
+
+/// Recognises a *direct* call to a sender-predicate helper (per
+/// [`bool_predicate_fns`]) and records it as a detected sender check.
+/// Covers the dominant CosmWasm authorization idiom where the comparison sits
+/// in a boolean helper and the caller branches on its result:
+///
+/// ```ignore
+/// if !is_trusted(&info.sender, &config) { return Err(Unauthorized {}) }   // Oak CTF-03
+/// if !is_approved_or_owner(deps.as_ref(), &info.sender, &token_id)? { .. }
+/// require!(OWNER.is_owner(deps.as_ref(), &info.sender)?, Unauthorized);
+/// ensure!(contract.is_owner_or_operator(deps.storage, info.sender.as_str())?, ..);
+/// ```
+///
+/// The synthetic comparison's result is the call destination, so the existing
+/// alias resolution walks `?`-glue and `!` back to it and
+/// [`effective_guard_locations`] treats the branch like a direct guard.
+///
+/// Deliberately uses a non-equality `op`: [`authorized_gate_locations`] only
+/// considers `Eq`/`Ne` and therefore skips these. That is intentional — for a
+/// boolean helper the *polarity* is not recoverable (`if is_owner` vs
+/// `if !is_owner` alias to the same local once `Not` is erased), so these
+/// comparisons must not drive edge-sensitive gating, only the
+/// divergence-based one, which is polarity-independent because it requires a
+/// branch that abandons the Ok-path.
+pub fn predicate_call_comparisons<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    sender_predicate: &HashSet<DefId>,
+) -> Vec<SenderComparison> {
+    let mut out = Vec::new();
+    if sender_predicate.is_empty() {
+        return out;
+    }
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call {
+            func, destination, ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let Some(callee) = utility::callee_def_id(tcx, body, func) else {
+            continue;
+        };
+        if !sender_predicate.contains(&callee) {
+            continue;
+        }
+        out.push(SenderComparison {
+            location: Location {
+                block: bb,
+                statement_index: data.statements.len(),
+            },
+            sender_local: destination.local,
+            compared_local: destination.local,
+            op: BinOp::Ge, // see doc comment: excluded from edge-sensitive gating
+            description: format!(
+                "sender-predicate helper '{}': result branches as an authorization guard",
+                tcx.item_name(callee)
+            ),
+        });
+    }
+    out
 }
 
 /// Recognises `Option`/`bool`-predicate combinators whose closure argument is a
