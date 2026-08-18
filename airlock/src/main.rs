@@ -141,18 +141,36 @@ fn run_analysis(args: &Vec<String>) {
             let (fn_comparisons, storage_inventory) =
                 find_auth_states(tcx, &call_graph, storage_inventory);
 
-            let always_checks = analysis::compute_always_checks(tcx, &call_graph, &fn_comparisons);
-
-            // Closures/functions whose boolean return is an `info.sender`
-            // comparison. Lets the gating recognise `Option`-predicate auth
-            // guards (`owner.map_or(true, |o| o != info.sender)`) whose check
-            // hides inside a combinator closure. Computed once over the stable
-            // per-function comparison summary.
+            // Praedikat-Zusammenfassungen aus den ROHEN Vergleichen: welche
+            // Closures/Funktionen liefern einen Sender-Vergleich als Ergebnis?
+            // `sender_predicate` (praezise, mit Operator) fuer die Option-
+            // Kombinatoren, `bool_predicates` (lockerer) fuer boolesche
+            // Auth-Helfer, die intern verzweigen.
             let sender_predicate = analysis::sender_predicate_summary(tcx, &fn_comparisons);
-            // Boolesche Auth-Helfer (`is_trusted`, `is_approved_or_owner`, ...).
-            // Lockereres Kriterium als sender_predicate_summary: solche Helfer
-            // verzweigen meist intern, statt den Vergleich zurueckzugeben.
             let bool_predicates = analysis::bool_predicate_fns(tcx, &fn_comparisons);
+
+            // Die synthetischen Vergleiche EINMAL zentral einmischen, bevor die
+            // interprozeduralen Stufen laufen. Wurden sie erst in der End-
+            // auswertung ergaenzt, sah [3] Always-Checking und damit auch
+            // [5] Entry-Checked sie nicht — ein per Helfer abgesicherter Handler
+            // galt dann zwar selbst als gegatet, gab den Schutz aber nicht an
+            // aufgerufene Hilfsfunktionen weiter (z. B. `only_authorized(..)?`
+            // gefolgt von `_set_owner(..)`, wo der Write in der Hilfsfunktion
+            // liegt).
+            let mut fn_comparisons = fn_comparisons;
+            for node in call_graph.nodes.iter() {
+                if !node.is_local() || !tcx.is_mir_available(*node) {
+                    continue;
+                }
+                let body = tcx.optimized_mir(*node);
+                let mut extra = analysis::option_predicate_comparisons(tcx, body, &sender_predicate);
+                extra.extend(analysis::predicate_call_comparisons(tcx, body, &bool_predicates));
+                if !extra.is_empty() {
+                    fn_comparisons.entry(*node).or_default().extend(extra);
+                }
+            }
+
+            let always_checks = analysis::compute_always_checks(tcx, &call_graph, &fn_comparisons);
 
             // Closures that always check info.sender before every Ok-return.
             // Recognises the `Item::update(store, |s| { if sender != s.owner {..};
@@ -249,22 +267,9 @@ fn run_analysis(args: &Vec<String>) {
                     continue;
                 }
                 let body = tcx.optimized_mir(*node);
-                let mut comparisons = fn_comparisons.get(node).cloned().unwrap_or_default();
-                // Augment with synthetic comparisons for `Option`-predicate auth
-                // gates in this body (map_or / is_some_and / is_none_or over a
-                // sender-predicate closure). Additive: only reduces false positives.
-                comparisons.extend(analysis::option_predicate_comparisons(
-                    tcx,
-                    body,
-                    &sender_predicate,
-                ));
-                // Direkte Aufrufe boolescher Auth-Helfer (`if !is_trusted(..)`,
-                // `require!(is_owner(..)?, ..)`).
-                comparisons.extend(analysis::predicate_call_comparisons(
-                    tcx,
-                    body,
-                    &bool_predicates,
-                ));
+                // Enthaelt bereits die synthetischen Praedikat-Vergleiche (oben
+                // zentral eingemischt, damit auch [3] und [5] sie sehen).
+                let comparisons = fn_comparisons.get(node).cloned().unwrap_or_default();
                 let sites = sites_by_caller.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
                 let findings = analysis::analyze_access_control(
                     tcx,
