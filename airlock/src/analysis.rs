@@ -914,24 +914,82 @@ fn trace_to_load_call<'tcx>(
     None
 }
 
+/// Resolves the storage constant behind a load or write receiver local by
+/// following the assignment chain back to the `const` operand. The receiver is
+/// built as `_a = &_b; _b = const ITEM`, and at this stage the operand still
+/// carries the constant's `DefId` (`Const::Unevaluated`), so the item can be
+/// identified exactly instead of by type identity.
+///
+/// Returns `None` when the chain ends in an already evaluated constant, in a
+/// non-local constant (which has no inventory entry) or in an unsupported
+/// rvalue. Callers then fall back to the type-based resolution.
+fn resolve_storage_const_def_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    item_local: Local,
+) -> Option<DefId> {
+    let mut worklist = vec![item_local];
+    let mut seen: HashSet<Local> = HashSet::new();
+
+    while let Some(l) = worklist.pop() {
+        if !seen.insert(l) {
+            continue;
+        }
+        for (_, data) in body.basic_blocks.iter_enumerated() {
+            for stmt in &data.statements {
+                let StatementKind::Assign(assign) = &stmt.kind else {
+                    continue;
+                };
+                let (lhs, rhs) = assign.as_ref();
+                if lhs.local != l {
+                    continue;
+                }
+                match rhs {
+                    Rvalue::Use(Operand::Constant(c), _) => {
+                        if let rustc_middle::mir::Const::Unevaluated(uv, _) = c.const_ {
+                            if uv.def.is_local()
+                                && matches!(tcx.def_kind(uv.def), DefKind::Const { .. })
+                            {
+                                return Some(uv.def);
+                            }
+                        }
+                    }
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                    | Rvalue::Ref(_, _, p)
+                    | Rvalue::CopyForDeref(p) => worklist.push(p.local),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Resolves the storage constant a load receiver refers to.
 ///
-/// Matches the receiver's type against the type of every local `const` item
-/// via canonical type identity — both sides region-erased and compared as
-/// interned `Ty`s. String comparison of formatted types is unreliable here:
-/// MIR local types carry erased regions while `type_of` results carry
-/// early-bound ones, and their `Debug`/`Display` renderings differ.
+/// Primary path is [`resolve_storage_const_def_id`], which reads the
+/// constant's own `DefId` off the MIR operand and is therefore exact.
+///
+/// Fallback is canonical type identity against every local `const` item —
+/// both sides region-erased and compared as interned `Ty`s. String comparison
+/// of formatted types is unreliable here: MIR local types carry erased regions
+/// while `type_of` results carry early-bound ones, and their `Debug`/`Display`
+/// renderings differ. On that path two constants of the same type (e.g. two
+/// `Item<Config>`) are indistinguishable and the first match wins.
 ///
 /// Returns the constant's name and `DefId` on success; otherwise falls back
 /// to the normalized type string (display only, no `DefId`).
-///
-/// Inherent limit: two storage constants of the same type (e.g. two
-/// `Item<Config>`) are indistinguishable by type — the first match wins.
 fn find_storage_static_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     item_local: Local,
 ) -> (String, Option<DefId>) {
+    // Exact resolution via the constant's own `DefId` where available.
+    if let Some(def_id) = resolve_storage_const_def_id(tcx, body, item_local) {
+        return (tcx.item_name(def_id).to_string(), Some(def_id));
+    }
+
     let item_ty = body.local_decls[item_local].ty;
 
     // Peel all references — the load receiver is usually `&Item<T>`.
@@ -1965,9 +2023,10 @@ fn propagate_taint_forward<'tcx>(
     }
     let mut item_def_of: HashMap<Local, Option<DefId>> = HashMap::new();
     if !storage_receivers.is_empty() {
-        // One-pass type index over local storage consts (matches
+        // Fallback index for receivers whose constant cannot be resolved
+        // exactly: one-pass type index over local storage consts (matches
         // `find_storage_static_name`'s erased-type identity, first const of a
-        // type wins), then resolve each receiver by lookup.
+        // type wins).
         let mut const_by_ty: HashMap<Ty<'tcx>, DefId> = HashMap::new();
         for local_def_id in tcx.iter_local_def_id() {
             if matches!(tcx.def_kind(local_def_id), DefKind::Const { .. }) {
@@ -1978,6 +2037,10 @@ fn propagate_taint_forward<'tcx>(
         }
         for item_local in storage_receivers {
             item_def_of.entry(item_local).or_insert_with(|| {
+                if let Some(def_id) = resolve_storage_const_def_id(tcx, body, item_local) {
+                    return Some(def_id);
+                }
+
                 let mut base = body.local_decls[item_local].ty;
                 while let TyKind::Ref(_, inner, _) = base.kind() {
                     base = *inner;
