@@ -1,233 +1,168 @@
-use rustc_hir::def_id::DefId;
-use rustc_middle::mir::{Body, Local, Location, Operand, TerminatorKind};
-use rustc_middle::ty::{self, Instance, InstanceKind, TyCtxt, TyKind};
+//! Stage 2 — entry point and call graph.
+//!
+//! Starting from the `execute` entry point, the reachable part of the crate is
+//! explored at MIR level. Every `Call` terminator becomes a [`CallSite`] that
+//! records not only the callee but also the actual-to-formal argument mapping
+//! the interprocedural stages need: the actual argument at position `i`
+//! corresponds to the callee's formal parameter `_{i+1}`.
+//!
+//! The call sites are stored grouped by the function that contains them, which
+//! is the form all later stages read them in.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Default)]
-pub struct CallGraph {
-    pub edges: HashMap<DefId, Vec<DefId>>,
-    pub callers: HashMap<DefId, Vec<DefId>>,
-    pub nodes: HashSet<DefId>,
-    /// call sites per caller, in MIR order
-    pub call_sites: HashMap<DefId, Vec<CallSite>>,
-}
+use rustc_middle::mir::{Body, Local, Location, TerminatorKind};
+use rustc_middle::ty::{self, Instance, InstanceKind, TyCtxt, TyKind};
+use rustc_span::def_id::DefId;
 
-/// A resolved call at a concrete program point. Records the callee and
-/// the actual-to-formal parameter wiring needed for interprocedural
-/// propagation: actual argument at position `i` corresponds to the
-/// callee's formal parameter `Local::from_usize(i + 1)`.
+use crate::cosmwasm;
+use crate::mir_util::operand_local;
+
+/// A resolved call at a concrete program point.
 #[derive(Debug, Clone)]
 pub struct CallSite {
     /// Location of the `Call` terminator in the caller.
     pub location: Location,
-    /// Function that contains this call
+    /// Function containing this call.
     pub caller: DefId,
     /// Resolved callee.
     pub callee: DefId,
     /// Actual arguments as caller locals; `None` for constant operands.
     pub arg_locals: Vec<Option<Local>>,
-    /// Caller local receiving the return value.
-    pub destination: Local,
+}
+
+/// The call graph reachable from the entry point.
+#[derive(Debug)]
+pub struct CallGraph {
+    /// Entry point the graph was built from.
+    root: DefId,
+    /// Reachable functions in discovery order, so that later stages iterate
+    /// deterministically.
+    nodes: Vec<DefId>,
+    /// Call sites grouped by the function that contains them.
+    sites_by_caller: HashMap<DefId, Vec<CallSite>>,
 }
 
 impl CallGraph {
-    pub fn new() -> Self {
-        CallGraph {
-            edges: HashMap::new(),
-            callers: HashMap::new(),
-            nodes: HashSet::new(),
-            call_sites: HashMap::new(),
-        }
-    }
-
-    pub fn add_edge(&mut self, caller: DefId, callee: DefId) {
-        self.edges.entry(caller).or_default().push(callee);
-        self.callers.entry(callee).or_default().push(caller);
-        self.nodes.insert(callee);
-        self.nodes.insert(caller);
-    }
-
-    pub fn callees(&self, fn_id: DefId) -> &[DefId] {
-        self.edges.get(&fn_id).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-
-    pub fn call_sites(&self, fn_id: DefId) -> &[CallSite] {
-        self.call_sites
-            .get(&fn_id)
-            .map(|cs| cs.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn callers_of(&self, fn_id: DefId) -> &[DefId] {
-        self.callers
-            .get(&fn_id)
-            .map(|c| c.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn all_callers_of(&self, fn_id: DefId) -> HashSet<DefId> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(fn_id);
-        visited.insert(fn_id);
-        while let Some(current) = queue.pop_front() {
-            for &caller in self.callers_of(current) {
-                if visited.insert(caller) {
-                    queue.push_back(caller);
-                }
-            }
-        }
-        visited
-    }
-
-    pub fn all_callees_of(&self, fn_id: DefId) -> HashSet<DefId> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(fn_id);
-        visited.insert(fn_id);
-
-        while let Some(current) = queue.pop_front() {
-            for &callee in self.callees(current) {
-                if visited.insert(callee) {
-                    queue.push_back(callee);
-                }
-            }
-        }
-
-        visited
-    }
-
+    /// Breadth-first exploration from `root`. Only bodies the compiler can
+    /// hand us are descended into; a callee from a dependency crate still
+    /// becomes a node, so gating summaries can refer to it, but it has no
+    /// outgoing edges.
     pub fn build_from_root(tcx: TyCtxt<'_>, root: DefId) -> Self {
-        let mut graph = CallGraph::new();
-        let mut visited = HashSet::new();
+        let mut nodes = Vec::new();
+        let mut known: HashSet<DefId> = HashSet::new();
+        let mut sites_by_caller: HashMap<DefId, Vec<CallSite>> = HashMap::new();
+
         let mut queue = VecDeque::new();
-        visited.insert(root);
+        // The root is a node even if none of its calls resolve; otherwise a
+        // crate whose `execute` has no resolvable callee would be skipped by
+        // every later stage.
+        known.insert(root);
+        nodes.push(root);
         queue.push_back(root);
-        // The root must be a node even if none of its calls resolve —
-        // otherwise crates whose `execute` has no resolvable callees are
-        // skipped by every analysis stage.
-        graph.nodes.insert(root);
 
-        while let Some(caller_id) = queue.pop_front() {
-            if !caller_id.is_local() || !tcx.is_mir_available(caller_id) {
+        while let Some(caller) = queue.pop_front() {
+            let Some(body) = cosmwasm::body_of(tcx, caller) else {
                 continue;
-            }
-
-            let body = tcx.optimized_mir(caller_id);
+            };
 
             for call_site in collect_call_sites(tcx, body) {
-                let callee_id = call_site.callee;
-                graph.add_edge(caller_id, callee_id);
-                graph
-                    .call_sites
-                    .entry(callee_id)
-                    .or_default()
-                    .push(call_site);
-                if visited.insert(callee_id) {
-                    queue.push_back(callee_id);
-                }
-            }
-        }
-
-        eprintln!(
-            "[call_graph] Reachable functions from {:?}: {}",
-            root,
-            graph.nodes.len()
-        );
-
-        graph
-    }
-
-    /// Returns, for each function reachable from `root`, a representative
-    /// (shortest, BFS) call path `root → … → f`. Used for the call-string
-    /// in reported findings.
-    pub fn paths_from_root(&self, root: DefId) -> HashMap<DefId, Vec<DefId>> {
-        let mut paths: HashMap<DefId, Vec<DefId>> = HashMap::new();
-        paths.insert(root, vec![root]);
-
-        let mut queue = VecDeque::new();
-        queue.push_back(root);
-
-        while let Some(current) = queue.pop_front() {
-            let current_path = paths[&current].clone();
-            for &callee in self.callees(current) {
-                if !paths.contains_key(&callee) {
-                    let mut path = current_path.clone();
-                    path.push(callee);
-                    paths.insert(callee, path);
+                let callee = call_site.callee;
+                if known.insert(callee) {
+                    nodes.push(callee);
                     queue.push_back(callee);
                 }
+                sites_by_caller.entry(caller).or_default().push(call_site);
             }
         }
 
-        paths
+        CallGraph {
+            root,
+            nodes,
+            sites_by_caller,
+        }
+    }
+
+    pub fn root(&self) -> DefId {
+        self.root
+    }
+
+    /// All reachable functions, in discovery order.
+    pub fn nodes(&self) -> &[DefId] {
+        &self.nodes
+    }
+
+    /// The calls made inside `caller`.
+    pub fn call_sites_in(&self, caller: DefId) -> &[CallSite] {
+        self.sites_by_caller
+            .get(&caller)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Every call site of the graph, regardless of caller.
+    pub fn all_call_sites(&self) -> impl Iterator<Item = &CallSite> {
+        self.sites_by_caller.values().flatten()
     }
 }
 
-fn operand_local(operand: &Operand<'_>) -> Option<Local> {
-    match operand {
-        Operand::Copy(place) | Operand::Move(place) => Some(place.local),
-        _ => None,
-    }
-}
-
+/// Collects the resolved calls of a single body.
 fn collect_call_sites<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<CallSite> {
     let mut call_sites = Vec::new();
     let caller = body.source.def_id();
-    // NICHT fully_monomorphized(): build_from_root läuft auch in generische
-    // Funktionen (z. B. levana QueryablePair::Request<T>, transmuter
-    // impl IntoIterator). Deren MIR enthält unsubstituierte Parameter; im
-    // Codegen-TypingMode ist fehlgeschlagene Normalisierung ein ICE
-    // (normalize_erasing_regions.rs "Failed to normalize Alias").
-    let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
+
+    // Post-analysis rather than a fully monomorphized environment: the
+    // exploration also descends into generic functions whose MIR still
+    // contains unsubstituted parameters. In a codegen typing mode a failed
+    // normalization of those is an internal compiler error.
+    let typing_env = ty::TypingEnv::post_analysis(tcx, caller);
 
     for (block, block_data) in body.basic_blocks.iter_enumerated() {
         let terminator = block_data.terminator();
+        let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+            continue;
+        };
 
-        if let TerminatorKind::Call {
-            func,
-            args,
-            destination,
-            ..
-        } = &terminator.kind
-        {
-            let ty = func.ty(&body.local_decls, tcx);
+        match func.ty(&body.local_decls, tcx).kind() {
+            TyKind::FnDef(def_id, generic_args) => {
+                // Trait methods are resolved to the implementation where
+                // possible; the declaration is the fallback.
+                let callee = Instance::try_resolve(tcx, typing_env, *def_id, generic_args)
+                    .ok()
+                    .flatten()
+                    .map(|instance| match instance.def {
+                        InstanceKind::Item(id) => id,
+                        InstanceKind::Virtual(id, _) => id,
+                        other => other.def_id(),
+                    })
+                    .unwrap_or(*def_id);
 
-            match ty.kind() {
-                TyKind::FnDef(def_id, generic_args) => {
-                    let callee = Instance::try_resolve(tcx, typing_env, *def_id, generic_args)
-                        .ok()
-                        .flatten()
-                        .map(|instance| match instance.def {
-                            InstanceKind::Item(id) => id,
-                            InstanceKind::Virtual(id, _) => id,
-                            other => other.def_id(),
-                        })
-                        .unwrap_or(*def_id);
-
-                    call_sites.push(CallSite {
-                        location: Location {
-                            block,
-                            statement_index: block_data.statements.len(),
-                        },
-                        caller,
-                        callee,
-                        arg_locals: (args.iter().map(|a| operand_local(&a.node)).collect()),
-                        destination: destination.local,
-                    });
-                }
-                TyKind::FnPtr(..) => {
-                    // Function pointer: static analysis cannot resolve the callee -> skip
-                    eprintln!(
-                        "[call_graph] Skipping function pointer call at {:?} in {:?}",
+                call_sites.push(CallSite {
+                    location: Location {
                         block,
-                        body.source.def_id()
-                    );
-                }
-                _ => continue,
+                        statement_index: block_data.statements.len(),
+                    },
+                    caller,
+                    callee,
+                    arg_locals: args.iter().map(|a| operand_local(&a.node)).collect(),
+                });
             }
+            TyKind::FnPtr(..) => {
+                // Calls through a function pointer have no statically known
+                // target and are left out of the graph.
+                crate::report::skipped_function_pointer(block, caller);
+            }
+            _ => {}
         }
     }
 
     call_sites
+}
+
+/// Maps each call-terminator location to its resolved callee.
+pub fn callee_locations(call_sites: &[CallSite]) -> HashMap<Location, DefId> {
+    call_sites
+        .iter()
+        .map(|cs| (cs.location, cs.callee))
+        .collect()
 }
