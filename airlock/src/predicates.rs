@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hir::def::DefKind;
 use rustc_middle::mir::{
     BinOp, Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind,
 };
@@ -118,6 +119,25 @@ fn return_value_feeders<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
 /// inspects the sender and whose result triggers an early `Err` is an
 /// authorization check for all practical purposes, whereas one whose result
 /// merely selects a fee never becomes a gate.
+///
+/// A third shape puts the comparison one level deeper still, in the closure of
+/// a combinator applied to the storage load:
+///
+/// ```ignore
+/// pub fn is_owner(deps: Deps, sender: &Addr) -> bool {
+///     CONFIG.load(deps.storage)
+///         .map(|config| config.owner == sender)   // comparison lives HERE
+///         .unwrap_or(false)
+/// }
+/// ```
+///
+/// Stage 3 does find that comparison — the seeding wires `sender` into the
+/// closure as an upvar — but it records it under the *closure's* `DefId`. The
+/// helper's own body has none, so a lookup keyed on the helper comes up empty
+/// and the caller's `if !is_owner(..) { return Err(..) }` is not recognised as
+/// a gate. Comparisons found in a closure are therefore attributed to the
+/// function that lexically encloses it, which is the one the caller branches
+/// on. The caller-side restriction is unchanged and keeps this sound.
 pub fn bool_predicate_fns(
     tcx: TyCtxt<'_>,
     fn_comparisons: &HashMap<DefId, Vec<SenderComparison>>,
@@ -127,24 +147,51 @@ pub fn bool_predicate_fns(
         if comparisons.is_empty() {
             continue;
         }
-        let Some(body) = cosmwasm::body_of(tcx, def_id) else {
-            continue;
-        };
-        let returns_bool = match body.local_decls[Local::from_usize(0)].ty.kind() {
-            TyKind::Bool => true,
-            // `Result<bool, E>` / `Option<bool>`: the payload is the first
-            // type argument.
-            TyKind::Adt(_, args) => args
-                .types()
-                .next()
-                .is_some_and(|t| matches!(t.kind(), TyKind::Bool)),
-            _ => false,
-        };
-        if returns_bool {
-            out.insert(def_id);
+        // The body holding the comparison, plus — for a combinator closure —
+        // the helper that encloses it. For anything else the two coincide.
+        for candidate in [def_id, enclosing_fn(tcx, def_id)] {
+            if returns_boolish(tcx, candidate) {
+                out.insert(candidate);
+            }
         }
     }
     out
+}
+
+/// Walks out of any enclosing closures to the function item that lexically
+/// contains `def_id`; the identity for a body that is not a closure.
+///
+/// The iteration bound only guards against unexpectedly deep nesting — closures
+/// in the CosmWasm idioms this targets are nested one or two levels at most.
+fn enclosing_fn(tcx: TyCtxt<'_>, def_id: DefId) -> DefId {
+    let mut current = def_id;
+    for _ in 0..8 {
+        if !matches!(tcx.def_kind(current), DefKind::Closure) {
+            break;
+        }
+        let Some(parent) = tcx.opt_parent(current) else {
+            break;
+        };
+        current = parent;
+    }
+    current
+}
+
+/// Whether the body returns `bool`, or a `bool` wrapped in one type
+/// constructor — `Result<bool, E>` and `Option<bool>`, the shapes a fallible
+/// predicate called with `?` has.
+fn returns_boolish(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let Some(body) = cosmwasm::body_of(tcx, def_id) else {
+        return false;
+    };
+    match body.local_decls[Local::from_usize(0)].ty.kind() {
+        TyKind::Bool => true,
+        TyKind::Adt(_, args) => args
+            .types()
+            .next()
+            .is_some_and(|t| matches!(t.kind(), TyKind::Bool)),
+        _ => false,
+    }
 }
 
 /// Recognises a direct call to a boolean sender-predicate helper (per
